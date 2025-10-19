@@ -1,5 +1,7 @@
 import * as admin from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
+import axios from "axios";
+import moment from "moment-timezone";
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -12,7 +14,7 @@ export const postEvent = async (req: any, res: any) => {
     await db.collection("events").add({ uid, type, payload: payload ?? null, createdAt: admin.firestore.Timestamp.now() });
 
     const ctx = await loadContext(uid);
-    const policy = applyRules({ type, ctx });
+    const policy = await applyRules({ type, ctx, uid });
     if (policy.blocked) return res.json({ ok: true, decision: "none", reason: policy.reason });
 
     const decision = await askGooseAgent({ uid, type, ctx });
@@ -20,7 +22,7 @@ export const postEvent = async (req: any, res: any) => {
 
     const result = await routeAction(uid, decision);
     return res.json({ ok: true, result });
-  } catch (e:any) {
+  } catch (e: any) {
     console.error(e);
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -33,23 +35,59 @@ async function loadContext(uid: string) {
   return { stats, prefs, tz: userDoc.exists ? (userDoc.get("profile.tz") ?? "UTC") : "UTC" };
 }
 
-function applyRules({ type, ctx }: { type: string; ctx: any }) {
+function toMillis(v: any) {
+  if (!v && v !== 0) return 0;
+  if (typeof v === "number") return v;
+  if (v.toMillis && typeof v.toMillis === "function") return v.toMillis();
+  return Date.parse(String(v)) || 0;
+}
+
+async function applyRules({ type, ctx, uid }: { type: string; ctx: any; uid: string }) {
   const now = Date.now();
-  const last = ctx.stats?.lastEngagedAt ?? 0;
+  const last = toMillis(ctx.stats?.lastEngagedAt) ?? 0;
   const rateLimited = now - last < 1000 * 60 * 30; // 30m
 
-  // naive tz-aware quiet hours check
-  const quietHours = ctx.prefs?.quietHours ?? { start: 22, end: 8 }; // 22:00 - 08:00 default
-  const userOffsetHours = 0; // TODO: compute from tz
-  const hour = new Date(now + userOffsetHours * 3600 * 1000).getUTCHours();
-  const inQuiet = quietHours.start > quietHours.end ? (hour >= quietHours.start || hour < quietHours.end) : (hour >= quietHours.start && hour < quietHours.end);
+  // tz-aware quiet hours using moment-timezone
+  const tz = ctx.tz ?? process.env.DEFAULT_TZ ?? "UTC";
+  const quietHoursPref = ctx.prefs?.quietHours ?? { start: parseInt(process.env.DEFAULT_QUIET_START || "22"), end: parseInt(process.env.DEFAULT_QUIET_END || "8") };
+  const start = Number(quietHoursPref.start ?? 22);
+  const end = Number(quietHoursPref.end ?? 8);
+  const hour = Number(moment.tz(now, tz).hour());
+  const inQuiet = start > end ? (hour >= start || hour < end) : (hour >= start && hour < end);
+
+  // daily cap check (messages in last 24h)
+  const cap = Number(process.env.DAILY_CAP ?? 2);
+  let messagesCount = 0;
+  try {
+    const since = admin.firestore.Timestamp.fromMillis(now - 24 * 3600 * 1000);
+    const snap = await db.collection("messages").where("uid", "==", uid).where("sentAt", ">=", since).get();
+    messagesCount = snap.size;
+  } catch (err) {
+    console.warn("failed to count messages for daily cap check", err);
+  }
+  const capExceeded = messagesCount >= cap;
 
   const quiet = inQuiet;
-  return { blocked: rateLimited || quiet, reason: rateLimited ? "rate_limit" : quiet ? "quiet_hours" : undefined };
+  const blocked = rateLimited || quiet || capExceeded;
+  const reason = rateLimited ? "rate_limit" : quiet ? "quiet_hours" : capExceeded ? "daily_cap" : undefined;
+  return { blocked, reason, details: { rateLimited, quiet, capExceeded, messagesCount, cap } };
 }
 
 async function askGooseAgent(input: any) {
-  // stubbed LLM logic; replace with HTTP call to Goose agent runtime
+  // Call external Goose agent runtime if configured
+  const url = process.env.GOOSE_AGENT_URL;
+  const apiKey = process.env.GOOSE_API_KEY;
+  if (url) {
+    try {
+      const resp = await axios.post(url, { input }, { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined, timeout: 3000 });
+      if (resp.data) return resp.data;
+    } catch (e: any) {
+      console.warn("Goose agent call failed:", e.message);
+      // fallthrough to heuristic
+    }
+  }
+
+  // fallback heuristic
   if (input.type === "app_open" && (input.ctx.stats?.dropsCount ?? 0) === 0) {
     return { action: "message", body: "Got a thought to drop? Try a one-liner—tap + to post.", reason: "nudge_first_drop", score: 0.66 };
   }

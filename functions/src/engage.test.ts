@@ -1,6 +1,10 @@
 import { applyRules, consumeToken } from './engage';
 import * as admin from 'firebase-admin';
 
+// ensure emulator env + project for Firestore client
+process.env.FIRESTORE_EMULATOR_HOST = process.env.FIRESTORE_EMULATOR_HOST ?? "127.0.0.1:8080";
+process.env.GOOGLE_CLOUD_PROJECT = process.env.GOOGLE_CLOUD_PROJECT ?? "demo";
+
 jest.setTimeout(30000);
 
 describe('engage integration tests (firestore emulator)', () => {

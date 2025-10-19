@@ -20,6 +20,16 @@ export const postEvent = async (req: any, res: any) => {
     const decision = await askGooseAgent({ uid, type, ctx });
     await persistDecision(uid, type, decision);
 
+    // try to consume a token if decision requires an external action (like sending a message)
+    if (decision.action === "message") {
+      const consumed = await consumeToken(uid);
+      if (!consumed.ok) {
+        // record blocked decision due to velocity
+        await db.collection("engage_decisions").add({ uid, triggerId: type, decision: "blocked", reason: consumed.reason, createdAt: admin.firestore.Timestamp.now() });
+        return res.json({ ok: true, result: { skipped: true, reason: consumed.reason } });
+      }
+    }
+
     const result = await routeAction(uid, decision);
     return res.json({ ok: true, result });
   } catch (e: any) {

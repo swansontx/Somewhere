@@ -1,0 +1,459 @@
+*** Begin Patch
+*** Update File: SomewhereApp.swift
+@@
+-import SwiftUI
++import SwiftUI
++import FirebaseCore
++import FirebaseAppCheck
+@@
+-@main
+-struct SomewhereApp: App {
+-    @StateObject private var store = DropStore()
+-
+-    var body: some Scene {
+-        WindowGroup {
+-            RootTabView()
+-                .environmentObject(store)
+-        }
+-    }
+-}
++@main
++struct SomewhereApp: App {
++    @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
++    @StateObject private var store = DropStore()
++
++    var body: some Scene {
++        WindowGroup {
++            RootTabView()
++                .environmentObject(store)
++        }
++    }
++}
++
++// MARK: - Firebase bootstrap
++class AppDelegate: NSObject, UIApplicationDelegate {
++    func application(_ application: UIApplication,
++                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
++        // Simulator-friendly App Check (optional for dev)
++        #if DEBUG
++        AppCheck.setAppCheckProviderFactory(AppCheckDebugProviderFactory())
++        #endif
++        FirebaseApp.configure()
++        return true
++    }
++}
+*** End Patch
+*** Begin Patch
+*** Add File: Geohash.swift
++import Foundation
++import CoreLocation
++
++enum Geohash {
++    private static let base32 = Array("0123456789bcdefghjkmnpqrstuvwxyz")
++
++    static func encode(latitude: Double, longitude: Double, precision: Int = 7) -> String {
++        var latInterval = (-90.0, 90.0)
++        var lonInterval = (-180.0, 180.0)
++        var hash = ""
++        var isEvenBit = true
++        var bit = 0
++        var ch = 0
++
++        while hash.count < precision {
++            if isEvenBit {
++                let mid = (lonInterval.0 + lonInterval.1) / 2
++                if longitude > mid { ch |= (1 << (4 - bit)); lonInterval.0 = mid }
++                else { lonInterval.1 = mid }
++            } else {
++                let mid = (latInterval.0 + latInterval.1) / 2
++                if latitude > mid { ch |= (1 << (4 - bit)); latInterval.0 = mid }
++                else { latInterval.1 = mid }
++            }
++            isEvenBit.toggle()
++            if bit < 4 { bit += 1 } else { hash.append(base32[ch]); bit = 0; ch = 0 }
++        }
++        return hash
++    }
++
++    static func prefixesCovering(region: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double),
++                                 precision: Int = 5) -> Set<String> {
++        let pts = [
++            (region.minLat, region.minLon),
++            (region.minLat, region.maxLon),
++            (region.maxLat, region.minLon),
++            (region.maxLat, region.maxLon)
++        ]
++        return Set(pts.map { encode(latitude: $0.0, longitude: $0.1, precision: precision) })
++    }
++}
+*** End Patch
+*** Begin Patch
+*** Update File: HomeView.swift
+@@
+-import SwiftUI
+-import AuthenticationServices
+-import FirebaseAuth
+-import CryptoKit
++import SwiftUI
++import AuthenticationServices
++import FirebaseAuth
++import CryptoKit
+@@
+-struct HomeView: View {
+-    @Binding var showCreate: Bool
+-    @State private var currentUser: User? = Auth.auth().currentUser
+-    @State private var nonce = ""
++struct HomeView: View {
++    @Binding var showCreate: Bool
++    @State private var authUser: FirebaseAuth.User? = Auth.auth().currentUser
++    @State private var nonce = ""
++    @State private var showAlert = false
++    @State private var alertMsg = ""
+@@
+-            if currentUser == nil {
++            if authUser == nil {
+                 Text("Welcome to Somewhere")
+                     .font(.largeTitle).bold()
+                     .padding(.top, 60)
+@@
+-                SignInWithAppleButton(
+-                    .signIn,
+-                    onRequest: configure,
+-                    onCompletion: handle
+-                )
++                SignInWithAppleButton(.signIn,
++                    onRequest: configureAppleRequest,
++                    onCompletion: handleAppleResult
++                )
+                 .signInWithAppleButtonStyle(.black)
+                 .frame(height: 55)
+                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                 .padding(.horizontal)
++
++                Button("Continue as Guest") {
++                    Task {
++                        do {
++                            let result = try await Auth.auth().signInAnonymously()
++                            authUser = result.user
++                        } catch {
++                            present(error: error, hint: \"Anonymous sign-in failed.\")
++                        }
++                    }
++                }
++                .padding(.top, 4)
+             } else {
+                 Text("Drop something?")
+                     .font(.largeTitle).bold()
+                     .padding(.top, 40)
+@@
+                 Button("Sign out") {
+-                    try? Auth.auth().signOut()
+-                    currentUser = nil
++                    do {
++                        try Auth.auth().signOut()
++                        authUser = nil
++                    } catch {
++                        present(error: error, hint: \"Sign out failed.\")
++                    }
+                 }
+                 .padding(.top, 8)
+                 .foregroundColor(.red)
+@@
+-        .onAppear {
+-            currentUser = Auth.auth().currentUser
+-        }
+-        .animation(.easeInOut, value: currentUser != nil)
++        .onAppear { authUser = Auth.auth().currentUser }
++        .animation(.easeInOut, value: authUser != nil)
++        .alert(\"Oops\", isPresented: $showAlert, actions: { Button(\"OK\", role: .cancel) {} },
++               message: { Text(alertMsg) })
+     }
+ }
+ 
+-// MARK: - Sign in with Apple helpers
++// MARK: - Apple helpers
+ extension HomeView {
+-    private func configure(_ request: ASAuthorizationAppleIDRequest) {
++    private func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
+         nonce = randomNonce()
+         request.requestedScopes = [.fullName, .email]
+         request.nonce = sha256(nonce)
+     }
+ 
+-    private func handle(_ result: Result<ASAuthorization, Error>) {
++    private func handleAppleResult(_ result: Result<ASAuthorization, Error>) {
+         switch result {
+         case .success(let authResult):
+             guard
+-                let appleIDCredential = authResult.credential as? ASAuthorizationAppleIDCredential,
+-                let token = appleIDCredential.identityToken,
+-                let tokenString = String(data: token, encoding: .utf8)
++                let appleID = authResult.credential as? ASAuthorizationAppleIDCredential,
++                let tokenData = appleID.identityToken,
++                let tokenString = String(data: tokenData, encoding: .utf8)
+             else { return }
+ 
+-            let credential = OAuthProvider.credential(withProviderID: "apple.com",
+-                                                       idToken: tokenString,
+-                                                       rawNonce: nonce)
+-            Auth.auth().signIn(with: credential)
++            // Newer Firebase API
++            let credential = OAuthProvider.appleCredential(
++                withIDToken: tokenString,
++                rawNonce: nonce,
++                fullName: appleID.fullName
++            )
++            Auth.auth().signIn(with: credential) { _, error in
++                if let error = error { present(error: error, hint: \"Apple sign-in failed.\"); return }
++                authUser = Auth.auth().currentUser
++            }
+-        default: break
++        case .failure(let error):
++            present(error: error, hint: \"Apple authorization failed.\")
+         }
+     }
+ }
+@@
+ private func sha256(_ input: String) -> String {
+@@
+ }
+ 
+ private func randomNonce(length: Int = 32) -> String {
+@@
+ }
++
++// MARK: - Alert helpers
++private extension HomeView {
++    func present(message: String) {
++        alertMsg = message; showAlert = true
++        print(\"Auth message:\", message)
++    }
++    func present(error: Error, hint: String? = nil) {
++        alertMsg = (hint.map { $0 + \" \" } ?? \"\") + error.localizedDescription
++        showAlert = true
++        print(\"Auth error:\", error.localizedDescription)
++    }
++}
+*** End Patch
+*** Begin Patch
+*** Update File: DropStore.swift
+@@
+-import Foundation
+-import CoreLocation
+-import Combine
++import Foundation
++import CoreLocation
++import Combine
++import FirebaseAuth
++import FirebaseFirestore
+@@
+-@MainActor
+-final class DropStore: ObservableObject {
+-    @Published var currentUser = User(id: "me", name: "You")
+-    @Published var drops: [DropItem] = SampleData.initialDrops
+-    @Published var lifted: Set<String> = [] // drop IDs
++@MainActor
++final class DropStore: ObservableObject {
++    private let db = Firestore.firestore()
++
++    @Published var currentUser: User? = nil
++    @Published var drops: [DropItem] = []
++    @Published var lifted: Set<String> = []
++
++    private var listener: ListenerRegistration?
++
++    init() {
++        Task { await ensureSignedIn() }
++    }
+@@
+-    func createDrop(text: String,
+-                    visibility: DropVisibility,
+-                    at coordinate: CLLocationCoordinate2D) {
+-        let drop = DropItem(
+-            id: UUID().uuidString,
+-            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+-            author: currentUser,
+-            createdAt: .now,
+-            coordinate: coordinate,
+-            visibility: visibility
+-        )
+-        drops.insert(drop, at: 0)
++    // Ensure we have an auth user (anonymous fallback)
++    func ensureSignedIn() async {
++        if Auth.auth().currentUser == nil {
++            try? await Auth.auth().signInAnonymously()
++        }
++        if let u = Auth.auth().currentUser {
++            currentUser = User(id: u.uid, name: u.displayName ?? \"Guest\")
++        }
+     }
+ 
++    // Create a drop in Firestore (stores geohash)
++    func createDrop(text: String,
++                    visibility: DropVisibility,
++                    at coordinate: CLLocationCoordinate2D) {
++        guard let user = Auth.auth().currentUser else { return }
++        let geohash = Geohash.encode(latitude: coordinate.latitude, longitude: coordinate.longitude, precision: 7)
++        let data: [String: Any] = [
++            \"text\": text.trimmingCharacters(in: .whitespacesAndNewlines),
++            \"authorId\": user.uid,
++            \"createdAt\": Timestamp(date: Date()),
++            \"visibility\": visibility.rawValue,
++            \"location\": GeoPoint(latitude: coordinate.latitude, longitude: coordinate.longitude),
++            \"geohash\": geohash
++        ]
++        db.collection(\"drops\").addDocument(data: data) { err in
++            if let err = err { print(\"Create drop error:\", err.localizedDescription) }
++        }
++    }
++
++    // Listen to drops in current map region using geohash prefixes
++    func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
++        listener?.remove()
++        let prefixes = Geohash.prefixesCovering(region: (minLat, maxLat, minLon, maxLon), precision: 5)
++        var bucket: [String: DropItem] = [:]
++        for prefix in prefixes {
++            let start = prefix
++            let end = prefix + \"\u{f8ff}\"
++            db.collection(\"drops\")
++                .order(by: \"geohash\")
++                .start(at: [start])
++                .end(at: [end])
++                .addSnapshotListener { [weak self] snap, err in
++                    guard let self else { return }
++                    if let docs = snap?.documents {
++                        for doc in docs {
++                            let d = doc.data()
++                            guard
++                                let text = d[\"text\"] as? String,
++                                let vis = d[\"visibility\"] as? String,
++                                let geo = d[\"location\"] as? GeoPoint
++                            else { continue }
++                            let item = DropItem(
++                                id: doc.documentID,
++                                text: text,
++                                author: User(id: d[\"authorId\"] as? String ?? \"unknown\", name: \"Unknown\"),
++                                createdAt: (d[\"createdAt\"] as? Timestamp)?.dateValue() ?? .now,
++                                coordinate: .init(latitude: geo.latitude, longitude: geo.longitude),
++                                visibility: DropVisibility(rawValue: vis) ?? .public
++                            )
++                            bucket[item.id] = item
++                        }
++                    }
++                    self.drops = bucket.values.sorted(by: { $0.createdAt > $1.createdAt })
++                }
++        }
++    }
++
+     func toggleLift(_ drop: DropItem) {
+*** End Patch
+*** Begin Patch
+*** Update File: RootTabView.swift
+@@
+ struct RootTabView: View {
+     @EnvironmentObject var store: DropStore
+     @State private var selectedTab: Tab = .home
+     @State private var showCreate = false
+     @State private var lastDropLocation = CLLocationCoordinate2D(latitude: 37.775, longitude: -122.418)
+@@
+         }
+         .sheet(isPresented: $showCreate) {
+             DropCreationScreen(
+                 defaultCoordinate: lastDropLocation,
+-                onCreated: { _ in selectedTab = .map },
+-                onCancel: { /* no-op */ }
++                onCreated: { _ in
++                    showCreate = false
++                    DispatchQueue.main.async { selectedTab = .map }
++                },
++                onCancel: {
++                    showCreate = false
++                    DispatchQueue.main.async { selectedTab = .home }
++                }
+             )
+         }
+     }
+ }
+*** End Patch
+*** Begin Patch
+*** Update File: DropCreationScreen.swift
+@@
+ struct DropCreationScreen: View {
+     @EnvironmentObject var store: DropStore
++    @Environment(\.dismiss) private var dismiss
+@@
+     var onCreated: (CLLocationCoordinate2D) -> Void
+     var onCancel: () -> Void
+@@
+             .toolbar {
+                 ToolbarItem(placement: .cancellationAction) {
+-                    Button("Cancel") { onCancel() }
++                    Button("Cancel") {
++                        onCancel()
++                        dismiss()
++                    }
+                 }
+                 ToolbarItem(placement: .confirmationAction) {
+                     Button("Drop It") {
+                         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                         store.createDrop(text: text, visibility: visibility, at: defaultCoordinate)
+-                        onCreated(defaultCoordinate)
++                        onCreated(defaultCoordinate)
++                        dismiss()
+                     }
+                     .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                 }
+             }
+         }
+*** End Patch
+*** Begin Patch
+*** Update File: MapScreen.swift
+@@
+-            Map(position: .constant(.region(region)), interactionModes: .all, annotationItems: store.drops) { drop in
++            Map(coordinateRegion: $region, annotationItems: store.drops) { drop in
+                 MapAnnotation(coordinate: drop.coordinate) {
+                     Button {
+                         selectedDrop = drop
+                     } label: {
+                         Circle()
+@@
+         .sheet(item: $selectedDrop) { drop in
+             DropDetailScreen(drop: drop)
+         }
++        .onChange(of: region) { _, newRegion in
++            let minLat = newRegion.center.latitude - newRegion.span.latitudeDelta / 2
++            let maxLat = newRegion.center.latitude + newRegion.span.latitudeDelta / 2
++            let minLon = newRegion.center.longitude - newRegion.span.longitudeDelta / 2
++            let maxLon = newRegion.center.longitude + newRegion.span.longitudeDelta / 2
++            store.listenNearby(minLat: minLat, maxLat: maxLat, minLon: minLon, maxLon: maxLon)
++        }
++        .onAppear {
++            let minLat = region.center.latitude - region.span.latitudeDelta / 2
++            let maxLat = region.center.latitude + region.span.latitudeDelta / 2
++            let minLon = region.center.longitude - region.span.longitudeDelta / 2
++            let maxLon = region.center.longitude + region.span.longitudeDelta / 2
++            store.listenNearby(minLat: minLat, maxLat: maxLat, minLon: minLon, maxLon: maxLon)
++        }
+*** End Patch
+*** Begin Patch
+*** Add File: README.md
++# Somewhere iOS
++
++SwiftUI app with Firebase Auth (Apple + Anonymous), Firestore, and geohash-based map queries.
++
++## Setup
++1. Create a Firebase project → add iOS app with your **Bundle Identifier**.
++2. Download `GoogleService-Info.plist`, add to Xcode (target-checked).
++3. Add Swift Packages: `firebase-ios-sdk` → products: **FirebaseCore**, **FirebaseAuth**, **FirebaseFirestore**, (**FirebaseAppCheck** optional).
++4. In Firebase Console → Auth → enable **Apple** and **Anonymous** providers.
++5. Xcode → Signing & Capabilities → add **Sign in with Apple**.
++6. (Dev) App Check: leave enforcement off **or** keep the debug provider (enabled in `SomewhereApp.swift` under `#if DEBUG`).
++
++## Firestore (minimal)
++- Collection: `drops` docs contain: `text`, `authorId`, `createdAt`, `visibility`, `location` (GeoPoint), `geohash` (string).
++- Add composite index: `geohash ASC, createdAt DESC`.
++
++## Run
++Build for an **iPhone simulator** (not “My Mac”).  
++On first run, tap **Continue as Guest** or use **Sign in with Apple**.
+*** End Patch

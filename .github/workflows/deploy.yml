@@ -1,0 +1,53 @@
+name: Deploy Functions
+
+on:
+  workflow_dispatch: {} # manual-only deploy (no automatic deploys on push)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies (functions)
+        working-directory: ./functions
+        run: npm ci
+
+      - name: Ensure jq is available
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Decode FIREBASE_SERVICE_ACCOUNT
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          echo "$FIREBASE_SERVICE_ACCOUNT" | base64 --decode > $HOME/fsa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=$HOME/fsa.json
+          echo "Decoded service account to $HOME/fsa.json"
+
+      - name: Determine project id
+        id: project
+        run: |
+          PROJECT_ID=$(jq -r .project_id $HOME/fsa.json)
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Build functions (TypeScript)
+        working-directory: ./functions
+        run: npm run build
+
+      - name: Install firebase-tools
+        run: npm install -g firebase-tools@11
+
+      - name: Deploy functions
+        run: |
+          echo "Deploying functions to project: ${{ steps.project.outputs.project_id }}"
+          firebase deploy --only functions --project ${{ steps.project.outputs.project_id }}
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: $HOME/fsa.json

@@ -55,22 +55,73 @@ async function applyRules({ type, ctx, uid }: { type: string; ctx: any; uid: str
   const hour = Number(moment.tz(now, tz).hour());
   const inQuiet = start > end ? (hour >= start || hour < end) : (hour >= start && hour < end);
 
-  // daily cap check (messages in last 24h)
-  const cap = Number(process.env.DAILY_CAP ?? 2);
-  let messagesCount = 0;
+  // velocity limiting (token bucket) instead of fixed daily cap
+  const bucketCapacity = Number(process.env.TOKEN_CAPACITY ?? 5); // max burst
+  const refillIntervalMs = Number(process.env.TOKEN_REFILL_INTERVAL_MS ?? 30 * 60 * 1000); // default 30min
+  const refillTokens = Number(process.env.TOKEN_REFILL_TOKENS ?? 1); // tokens added per interval
+
+  const bucketRef = db.collection("rate_limits").doc(uid);
+  let tokensAvailable = bucketCapacity;
   try {
-    const since = admin.firestore.Timestamp.fromMillis(now - 24 * 3600 * 1000);
-    const snap = await db.collection("messages").where("uid", "==", uid).where("sentAt", ">=", since).get();
-    messagesCount = snap.size;
+    const snap = await bucketRef.get();
+    if (snap.exists) {
+      const data = snap.data() ?? {};
+      const last = toMillis(data.lastRefillAt) ?? 0;
+      const storedTokens = Number(data.tokens ?? bucketCapacity);
+      const intervals = Math.floor((now - last) / refillIntervalMs);
+      const refill = intervals * refillTokens;
+      tokensAvailable = Math.min(bucketCapacity, storedTokens + refill);
+    }
   } catch (err) {
-    console.warn("failed to count messages for daily cap check", err);
+    console.warn("failed to read rate bucket", err);
   }
-  const capExceeded = messagesCount >= cap;
+
+  const capExceeded = tokensAvailable < 1;
 
   const quiet = inQuiet;
   const blocked = rateLimited || quiet || capExceeded;
-  const reason = rateLimited ? "rate_limit" : quiet ? "quiet_hours" : capExceeded ? "daily_cap" : undefined;
-  return { blocked, reason, details: { rateLimited, quiet, capExceeded, messagesCount, cap } };
+  const reason = rateLimited ? "rate_limit" : quiet ? "quiet_hours" : capExceeded ? "velocity_limit" : undefined;
+  return { blocked, reason, details: { rateLimited, quiet, capExceeded, tokensAvailable, bucketCapacity, refillIntervalMs, refillTokens } };
+}
+
+async function consumeToken(uid: string) {
+  const bucketRef = db.collection("rate_limits").doc(uid);
+  const bucketCapacity = Number(process.env.TOKEN_CAPACITY ?? 5);
+  const refillIntervalMs = Number(process.env.TOKEN_REFILL_INTERVAL_MS ?? 30 * 60 * 1000);
+  const refillTokens = Number(process.env.TOKEN_REFILL_TOKENS ?? 1);
+
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(bucketRef);
+      const now = Date.now();
+      let tokens = bucketCapacity;
+      let last = now;
+      if (snap.exists) {
+        const data = snap.data() ?? {};
+        last = toMillis(data.lastRefillAt) || now;
+        const storedTokens = Number(data.tokens ?? bucketCapacity);
+        const intervals = Math.floor((now - last) / refillIntervalMs);
+        const refill = intervals * refillTokens;
+        tokens = Math.min(bucketCapacity, storedTokens + refill);
+        // update last to account for intervals
+        if (intervals > 0) {
+          last = last + intervals * refillIntervalMs;
+        }
+      }
+
+      if (tokens < 1) {
+        throw new Error("velocity_limit");
+      }
+
+      tokens = tokens - 1;
+      await tx.set(bucketRef, { tokens, lastRefillAt: admin.firestore.Timestamp.fromMillis(last) }, { merge: true });
+    });
+    return { ok: true };
+  } catch (err: any) {
+    if (err.message === "velocity_limit") return { ok: false, reason: "velocity_limit" };
+    console.warn("failed to consume token", err);
+    return { ok: false, reason: "error" };
+  }
 }
 
 async function askGooseAgent(input: any) {

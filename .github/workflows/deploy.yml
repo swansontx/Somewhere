@@ -1,9 +1,7 @@
 name: Deploy Functions
 
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch: {} # manual-only deploy (no automatic deploys on push)
 
 jobs:
   deploy:

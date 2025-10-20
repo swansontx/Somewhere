@@ -11,12 +11,18 @@ final class DropStore: ObservableObject {
     // Published state for UI
     @Published var currentUser: User? = nil
     @Published var drops: [DropItem] = []
-    @Published private(set) var updatingDropIds: Set<String> = []
+    @Published var lifted: Set<String> = []
 
-    private var listener: ListenerRegistration?
+    private var listeners: [ListenerRegistration] = []
+    private var remoteDrops: [String: DropItem] = [:]
+    private var optimisticDrops: [String: DropItem] = [:]
 
     init() {
         Task { await ensureSignedIn() }
+    }
+
+    deinit {
+        listeners.forEach { $0.remove() }
     }
 
     // MARK: - Authentication Handling
@@ -44,6 +50,10 @@ final class DropStore: ObservableObject {
             try Auth.auth().signOut()
             currentUser = nil
             drops.removeAll()
+            optimisticDrops.removeAll()
+            remoteDrops.removeAll()
+            listeners.forEach { $0.remove() }
+            listeners.removeAll()
         } catch {
             print("Error signing out:", error.localizedDescription)
         }
@@ -59,27 +69,75 @@ final class DropStore: ObservableObject {
             return
         }
 
-        let geohash = Geohash.encode(latitude: coordinate.latitude,
-                                     longitude: coordinate.longitude,
-                                     precision: 7)
+        let createdAt = Date()
+        let docRef = db.collection("drops").document()
+        let dropId = docRef.documentID
+        let author = currentUser ?? User(id: user.uid, name: user.displayName ?? "You")
 
-        let data: [String: Any] = [
-            "text": text.trimmingCharacters(in: .whitespacesAndNewlines),
-            "authorId": user.uid,
-            "createdAt": Timestamp(date: Date()),
-            "visibility": visibility.rawValue,
-            "location": GeoPoint(latitude: coordinate.latitude,
-                                 longitude: coordinate.longitude),
-            "geohash": geohash,
-            "reactionsCount": 0,
-            "liftsCount": 0
-        ]
+        var optimistic = DropItem(
+            id: dropId,
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            author: author,
+            createdAt: createdAt,
+            coordinate: coordinate,
+            visibility: visibility,
+            reactions: 0,
+            isLiftedByCurrentUser: false,
+            syncStatus: .pending
+        )
 
-        db.collection("drops").addDocument(data: data) { error in
-            if let error = error {
-                print("Error creating drop:", error.localizedDescription)
-            } else {
-                print("✅ Drop created successfully")
+        optimisticDrops[dropId] = optimistic
+        publishDrops()
+
+        let payload = dropPayload(for: optimistic, authorId: user.uid)
+
+        docRef.setData(payload) { [weak self] error in
+            guard let self else { return }
+            Task { @MainActor in
+                if let error = error {
+                    print("Error creating drop:", error.localizedDescription)
+                    optimistic.syncStatus = .failed(message: error.localizedDescription)
+                    self.optimisticDrops[dropId] = optimistic
+                } else {
+                    optimistic.syncStatus = .synced
+                    self.optimisticDrops[dropId] = optimistic
+                    print("✅ Drop created successfully")
+                }
+                self.publishDrops()
+            }
+        }
+    }
+
+    func retryCreate(drop: DropItem) {
+        guard case .failed = drop.syncStatus else { return }
+        guard let user = Auth.auth().currentUser else {
+            print("User not signed in")
+            return
+        }
+
+        var retryDrop = drop
+        retryDrop.author = User(id: user.uid, name: user.displayName ?? drop.author.name)
+        retryDrop.createdAt = Date()
+        retryDrop.syncStatus = .pending
+        optimisticDrops[drop.id] = retryDrop
+        publishDrops()
+
+        let payload = dropPayload(for: retryDrop, authorId: user.uid)
+        let docRef = db.collection("drops").document(drop.id)
+
+        docRef.setData(payload) { [weak self] error in
+            guard let self else { return }
+            Task { @MainActor in
+                if let error = error {
+                    print("Retry failed:", error.localizedDescription)
+                    retryDrop.syncStatus = .failed(message: error.localizedDescription)
+                    self.optimisticDrops[drop.id] = retryDrop
+                } else {
+                    retryDrop.syncStatus = .synced
+                    self.optimisticDrops[drop.id] = retryDrop
+                    print("✅ Drop retried successfully")
+                }
+                self.publishDrops()
             }
         }
     }
@@ -87,19 +145,20 @@ final class DropStore: ObservableObject {
     // MARK: - Nearby Fetch / Realtime Listener
 
     func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
-        listener?.remove()
+        listeners.forEach { $0.remove() }
+        listeners.removeAll()
+        remoteDrops.removeAll()
 
         let prefixes = Geohash.prefixesCovering(
             region: (minLat, maxLat, minLon, maxLon),
             precision: 5
         )
 
-        var collected: [String: DropItem] = [:]
         for prefix in prefixes {
             let start = prefix
             let end = prefix + "\u{f8ff}"
 
-            db.collection("drops")
+            let registration = db.collection("drops")
                 .order(by: "geohash")
                 .start(at: [start])
                 .end(at: [end])
@@ -111,186 +170,114 @@ final class DropStore: ObservableObject {
                         return
                     }
 
-                    if let docs = snap?.documents {
-                        for doc in docs {
-                            guard let item = self.makeDropItem(from: doc) else { continue }
-                            collected[item.id] = item
+                    guard let snap else { return }
+
+                    for change in snap.documentChanges {
+                        let doc = change.document
+                        let data = doc.data()
+                        guard
+                            let text = data["text"] as? String,
+                            let vis = data["visibility"] as? String,
+                            let geo = data["location"] as? GeoPoint
+                        else { continue }
+
+                        let item = DropItem(
+                            id: doc.documentID,
+                            text: text,
+                            author: User(id: data["authorId"] as? String ?? "unknown",
+                                         name: "Unknown"),
+                            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? .now,
+                            coordinate: CLLocationCoordinate2D(latitude: geo.latitude,
+                                                               longitude: geo.longitude),
+                            visibility: DropVisibility(rawValue: vis) ?? .public,
+                            reactions: 0,
+                            isLiftedByCurrentUser: lifted.contains(doc.documentID),
+                            syncStatus: .synced
+                        )
+
+                        switch change.type {
+                        case .added, .modified:
+                            self.remoteDrops[item.id] = item
+                        case .removed:
+                            self.remoteDrops.removeValue(forKey: item.id)
+                        @unknown default:
+                            break
                         }
                     }
 
-                    let sortedDrops = collected.values.sorted(by: { $0.createdAt > $1.createdAt })
-                    self.drops = sortedDrops
-
-                    Task { [weak self] in
-                        await self?.populateUserStats(for: sortedDrops.map { $0.id })
-                    }
+                    self.publishDrops()
                 }
+            listeners.append(registration)
         }
     }
 
-    // MARK: - Reaction & Lift Persistence
+    // MARK: - Reactions & Lifts (Local Only for Now)
 
-    func isUpdating(dropId: String) -> Bool {
-        updatingDropIds.contains(dropId)
-    }
-
-    func toggleLift(_ drop: DropItem) async {
-        await persistStatChange(
-            for: drop,
-            statKey: "lifted",
-            counterField: "liftsCount"
-        )
-    }
-
-    func react(to drop: DropItem) async {
-        await persistStatChange(
-            for: drop,
-            statKey: "reacted",
-            counterField: "reactionsCount"
-        )
-    }
-
-    private func persistStatChange(for drop: DropItem,
-                                   statKey: String,
-                                   counterField: String) async {
-        guard let user = currentUser else {
-            print("No authenticated user available to update stats")
-            return
+    func toggleLift(_ drop: DropItem) {
+        if lifted.contains(drop.id) {
+            lifted.remove(drop.id)
+        } else {
+            lifted.insert(drop.id)
         }
-
-        let dropId = drop.id
-        if updatingDropIds.contains(dropId) { return }
-
-        updatingDropIds.insert(dropId)
-        defer { updatingDropIds.remove(dropId) }
-
-        let dropRef = db.collection("drops").document(dropId)
-        let statsRef = dropRef.collection("stats").document(user.id)
-
-        do {
-            let statsSnapshot = try await fetchDocument(statsRef)
-            let statsData = statsSnapshot.data() ?? [:]
-            let previousValue = statsData[statKey] as? Bool ?? false
-            let newValue = !previousValue
-
-            let batch = db.batch()
-            batch.setData([statKey: newValue], forDocument: statsRef, merge: true)
-            let delta = FieldValue.increment(Int64(newValue ? 1 : -1))
-            batch.updateData([counterField: delta], forDocument: dropRef)
-
-            try await commit(batch: batch)
-            await refreshDrop(withId: dropId)
-        } catch {
-            print("Error updating stats for drop \(dropId):", error.localizedDescription)
+        if let i = drops.firstIndex(where: { $0.id == drop.id }) {
+            drops[i].isLiftedByCurrentUser = lifted.contains(drop.id)
         }
+        if var remote = remoteDrops[drop.id] {
+            remote.isLiftedByCurrentUser = lifted.contains(drop.id)
+            remoteDrops[drop.id] = remote
+        }
+        if var optimistic = optimisticDrops[drop.id] {
+            optimistic.isLiftedByCurrentUser = lifted.contains(drop.id)
+            optimisticDrops[drop.id] = optimistic
+        }
+        publishDrops()
     }
 
-    private func populateUserStats(for dropIds: [String]) async {
-        guard let user = currentUser else { return }
+    func react(to drop: DropItem) {
+        if let i = drops.firstIndex(where: { $0.id == drop.id }) {
+            drops[i].reactions += 1
+        }
+        if var remote = remoteDrops[drop.id] {
+            remote.reactions += 1
+            remoteDrops[drop.id] = remote
+        }
+        if var optimistic = optimisticDrops[drop.id] {
+            optimistic.reactions += 1
+            optimisticDrops[drop.id] = optimistic
+        }
+        publishDrops()
+    }
 
-        for dropId in dropIds {
-            let statsRef = db.collection("drops").document(dropId).collection("stats").document(user.id)
-            do {
-                let snapshot = try await fetchDocument(statsRef)
-                let data = snapshot.data() ?? [:]
-                if let index = drops.firstIndex(where: { $0.id == dropId }) {
-                    drops[index].hasReacted = data["reacted"] as? Bool ?? false
-                    drops[index].isLiftedByCurrentUser = data["lifted"] as? Bool ?? false
-                }
-            } catch {
-                print("Error loading stats for drop \(dropId):", error.localizedDescription)
+    // MARK: - Helpers
+
+    private func publishDrops() {
+        let syncedIds = optimisticDrops.compactMap { id, drop -> String? in
+            if remoteDrops[id] != nil, drop.syncStatus == .synced {
+                return id
             }
+            return nil
         }
+        syncedIds.forEach { optimisticDrops.removeValue(forKey: $0) }
+
+        var combined = Array(remoteDrops.values)
+        combined.append(contentsOf: optimisticDrops.values)
+        combined.sort(by: { $0.createdAt > $1.createdAt })
+        drops = combined
     }
 
-    private func refreshDrop(withId id: String) async {
-        guard let user = currentUser else { return }
+    private func dropPayload(for drop: DropItem, authorId: String) -> [String: Any] {
+        let geohash = Geohash.encode(latitude: drop.coordinate.latitude,
+                                     longitude: drop.coordinate.longitude,
+                                     precision: 7)
 
-        let dropRef = db.collection("drops").document(id)
-
-        do {
-            let dropSnapshot = try await fetchDocument(dropRef)
-
-            guard dropSnapshot.exists, let updatedDrop = makeDropItem(from: dropSnapshot) else {
-                drops.removeAll { $0.id == id }
-                return
-            }
-
-            let statsSnapshot = try await fetchDocument(dropRef.collection("stats").document(user.id))
-            let statsData = statsSnapshot.data() ?? [:]
-            var mergedDrop = updatedDrop
-            mergedDrop.hasReacted = statsData["reacted"] as? Bool ?? false
-            mergedDrop.isLiftedByCurrentUser = statsData["lifted"] as? Bool ?? false
-
-            if let index = drops.firstIndex(where: { $0.id == id }) {
-                drops[index] = mergedDrop
-            } else {
-                drops.append(mergedDrop)
-                drops.sort(by: { $0.createdAt > $1.createdAt })
-            }
-        } catch {
-            print("Error refreshing drop \(id):", error.localizedDescription)
-        }
-    }
-
-    private func makeDropItem(from snapshot: DocumentSnapshot) -> DropItem? {
-        let data = snapshot.data()
-
-        guard
-            let text = data?["text"] as? String,
-            let visibilityRaw = data?["visibility"] as? String,
-            let geoPoint = data?["location"] as? GeoPoint
-        else { return nil }
-
-        let authorId = data?["authorId"] as? String ?? "unknown"
-        let author = User(id: authorId, name: "Unknown")
-        let createdAt = (data?["createdAt"] as? Timestamp)?.dateValue() ?? .now
-        let visibility = DropVisibility(rawValue: visibilityRaw) ?? .public
-        let reactionCount = data?["reactionsCount"] as? Int
-            ?? data?["reactions"] as? Int
-            ?? 0
-        let liftCount = data?["liftsCount"] as? Int ?? 0
-
-        return DropItem(
-            id: snapshot.documentID,
-            text: text,
-            author: author,
-            createdAt: createdAt,
-            coordinate: CLLocationCoordinate2D(latitude: geoPoint.latitude,
-                                               longitude: geoPoint.longitude),
-            visibility: visibility,
-            reactionCount: reactionCount,
-            liftCount: liftCount
-        )
-    }
-
-    private func fetchDocument(_ reference: DocumentReference) async throws -> DocumentSnapshot {
-        try await withCheckedThrowingContinuation { continuation in
-            reference.getDocument { snapshot, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else if let snapshot = snapshot {
-                    continuation.resume(returning: snapshot)
-                } else {
-                    continuation.resume(throwing: NSError(
-                        domain: "DropStore",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Missing snapshot"]
-                    ))
-                }
-            }
-        }
-    }
-
-    private func commit(batch: WriteBatch) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            batch.commit { error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
-        }
+        return [
+            "text": drop.text,
+            "authorId": authorId,
+            "createdAt": Timestamp(date: drop.createdAt),
+            "visibility": drop.visibility.rawValue,
+            "location": GeoPoint(latitude: drop.coordinate.latitude,
+                                  longitude: drop.coordinate.longitude),
+            "geohash": geohash
+        ]
     }
 }

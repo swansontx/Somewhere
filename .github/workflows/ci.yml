@@ -23,19 +23,44 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('functions/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
 
       - name: Install functions deps
         working-directory: ./functions
-        run: npm ci
+        env:
+          NODE_ENV: development
+        run: npm ci --silent
 
-      - name: Install firebase-tools
-        run: npm install -g firebase-tools@11
-
-      - name: Start Firestore emulator
+      - name: Start Firestore emulator (use local binary when possible)
+        working-directory: ./functions
+        env:
+          NODE_ENV: development
         run: |
-          firebase emulators:start --only firestore --project demo --host 127.0.0.1 --port 8080 &
-          npx wait-on tcp:127.0.0.1:8080
+          echo "Listing ./node_modules/.bin"
+          ls -la ./node_modules/.bin || true
+          if [ -x ./node_modules/.bin/firebase ]; then
+            echo "Using local firebase binary"
+            ./node_modules/.bin/firebase emulators:start --only firestore --project demo &
+          else
+            echo "Local firebase binary not found, attempting installer"
+            curl -sL https://firebase.tools | bash || true
+            firebase emulators:start --only firestore --project demo &
+          fi
+
+          # wait for emulator (prefer local wait-on)
+          if [ -x ./node_modules/.bin/wait-on ]; then
+            ./node_modules/.bin/wait-on tcp:127.0.0.1:8080
+          else
+            npx wait-on tcp:127.0.0.1:8080
+          fi
         env:
           FIREBASE_PROJECT: demo
 
@@ -43,4 +68,4 @@ jobs:
         working-directory: ./functions
         env:
           FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
-        run: npm test
+        run: npm test --silent

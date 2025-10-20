@@ -1,6 +1,7 @@
 import Foundation
 import CoreLocation
 import Combine
+import MapKit
 import FirebaseAuth
 import FirebaseFirestore
 
@@ -84,20 +85,40 @@ final class DropStore: ObservableObject {
 
     // MARK: - Nearby Fetch / Realtime Listener
 
-    func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
+    func listenNearby(in region: MKCoordinateRegion) {
+        let bounds = boundingBox(for: region)
+        listenNearby(minLat: bounds.minLat,
+                     maxLat: bounds.maxLat,
+                     minLon: bounds.minLon,
+                     maxLon: bounds.maxLon)
+    }
+
+    func stopListeningNearby() {
         listener?.remove()
+        listener = nil
+    }
+
+    private func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
+        stopListeningNearby()
 
         let prefixes = Geohash.prefixesCovering(
             region: (minLat, maxLat, minLon, maxLon),
             precision: 5
         )
 
+        guard !prefixes.isEmpty else {
+            drops = []
+            return
+        }
+
         var collected: [String: DropItem] = [:]
+        var registrations: [ListenerRegistration] = []
+
         for prefix in prefixes {
             let start = prefix
             let end = prefix + "\u{f8ff}"
 
-            db.collection("drops")
+            let registration = db.collection("drops")
                 .order(by: "geohash")
                 .start(at: [start])
                 .end(at: [end])
@@ -134,9 +155,36 @@ final class DropStore: ObservableObject {
 
                     self.drops = collected.values.sorted(by: { $0.createdAt > $1.createdAt })
                 }
+
+            registrations.append(registration)
         }
+
+        listener = ListenerToken(registrations: registrations)
     }
 
+    private func boundingBox(for region: MKCoordinateRegion) -> (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
+        let halfLat = region.span.latitudeDelta / 2
+        let halfLon = region.span.longitudeDelta / 2
+
+        var minLat = max(-90, region.center.latitude - halfLat)
+        var maxLat = min(90, region.center.latitude + halfLat)
+
+        var minLon = region.center.longitude - halfLon
+        var maxLon = region.center.longitude + halfLon
+
+        if minLon < -180 { minLon = -180 }
+        if maxLon > 180 { maxLon = 180 }
+
+        if minLat > maxLat {
+            swap(&minLat, &maxLat)
+        }
+        if minLon > maxLon {
+            swap(&minLon, &maxLon)
+        }
+
+        return (minLat, maxLat, minLon, maxLon)
+    }
+    
     // MARK: - Reactions & Lifts (Local Only for Now)
 
     func toggleLift(_ drop: DropItem) {
@@ -154,5 +202,21 @@ final class DropStore: ObservableObject {
         if let i = drops.firstIndex(where: { $0.id == drop.id }) {
             drops[i].reactions += 1
         }
+    }
+}
+
+private final class ListenerToken: ListenerRegistration {
+    private var registrations: [ListenerRegistration]
+    private var isActive = true
+
+    init(registrations: [ListenerRegistration]) {
+        self.registrations = registrations
+    }
+
+    func remove() {
+        guard isActive else { return }
+        isActive = false
+        registrations.forEach { $0.remove() }
+        registrations.removeAll()
     }
 }

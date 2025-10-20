@@ -27,7 +27,7 @@ jobs:
 
       - name: Install functions deps
         working-directory: ./functions
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Install firebase-tools
         run: npm install -g firebase-tools@11

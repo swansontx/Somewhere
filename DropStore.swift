@@ -63,17 +63,41 @@ final class DropStore: ObservableObject {
                                      longitude: coordinate.longitude,
                                      precision: 7)
 
+        let dropRef = db.collection("drops").document()
+        let userRef = db.collection("users").document(user.uid)
+        let now = Timestamp(date: Date())
+
         let data: [String: Any] = [
             "text": text.trimmingCharacters(in: .whitespacesAndNewlines),
             "authorId": user.uid,
-            "createdAt": Timestamp(date: Date()),
+            "createdAt": now,
             "visibility": visibility.rawValue,
             "location": GeoPoint(latitude: coordinate.latitude,
                                  longitude: coordinate.longitude),
-            "geohash": geohash
+            "geohash": geohash,
+            "reactionsCount": 0
         ]
 
-        db.collection("drops").addDocument(data: data) { error in
+        db.runTransaction({ (transaction, errorPointer) -> Any? in
+            transaction.setData(data, forDocument: dropRef)
+
+            let snapshot: DocumentSnapshot
+            do {
+                snapshot = try transaction.getDocument(userRef)
+            } catch let fetchError as NSError {
+                errorPointer?.pointee = fetchError
+                return nil
+            }
+
+            var stats = snapshot.data()?["stats"] as? [String: Any] ?? [:]
+            let currentCount = (stats["dropsCount"] as? Int ?? 0) + 1
+            stats["dropsCount"] = currentCount
+            stats["lastDropAt"] = now
+            stats["lastEngagedAt"] = now
+
+            transaction.setData(["stats": stats], forDocument: userRef, merge: true)
+            return dropRef.documentID
+        }) { _, error in
             if let error = error {
                 print("Error creating drop:", error.localizedDescription)
             } else {
@@ -126,7 +150,8 @@ final class DropStore: ObservableObject {
                                 createdAt: (d["createdAt"] as? Timestamp)?.dateValue() ?? .now,
                                 coordinate: CLLocationCoordinate2D(latitude: geo.latitude,
                                                                    longitude: geo.longitude),
-                                visibility: DropVisibility(rawValue: vis) ?? .public
+                                visibility: DropVisibility(rawValue: vis) ?? .public,
+                                reactions: d["reactionsCount"] as? Int ?? 0
                             )
                             collected[item.id] = item
                         }
@@ -151,8 +176,19 @@ final class DropStore: ObservableObject {
     }
 
     func react(to drop: DropItem) {
-        if let i = drops.firstIndex(where: { $0.id == drop.id }) {
-            drops[i].reactions += 1
+        let dropRef = db.collection("drops").document(drop.id)
+        dropRef.updateData(["reactionsCount": FieldValue.increment(Int64(1))]) { [weak self] error in
+            if let error = error {
+                print("Error recording reaction:", error.localizedDescription)
+                return
+            }
+
+            Task { @MainActor in
+                guard let self else { return }
+                if let index = self.drops.firstIndex(where: { $0.id == drop.id }) {
+                    self.drops[index].reactions += 1
+                }
+            }
         }
     }
 }

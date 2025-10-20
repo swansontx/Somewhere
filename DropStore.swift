@@ -13,10 +13,16 @@ final class DropStore: ObservableObject {
     @Published var drops: [DropItem] = []
     @Published var lifted: Set<String> = []
 
-    private var listener: ListenerRegistration?
+    private var listeners: [ListenerRegistration] = []
+    private var dropCache: [String: DropItem] = [:]
+    private(set) var lastBounds: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)?
 
     init() {
         Task { await ensureSignedIn() }
+    }
+
+    deinit {
+        stopListening()
     }
 
     // MARK: - Authentication Handling
@@ -85,56 +91,93 @@ final class DropStore: ObservableObject {
     // MARK: - Nearby Fetch / Realtime Listener
 
     func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
-        listener?.remove()
+        stopListening()
+        dropCache.removeAll()
+        lastBounds = (minLat, maxLat, minLon, maxLon)
 
         let prefixes = Geohash.prefixesCovering(
             region: (minLat, maxLat, minLon, maxLon),
             precision: 5
         )
 
-        var collected: [String: DropItem] = [:]
+        guard !prefixes.isEmpty else {
+            drops.removeAll()
+            return
+        }
+
         for prefix in prefixes {
             let start = prefix
             let end = prefix + "\u{f8ff}"
 
-            db.collection("drops")
+            let registration = db.collection("drops")
                 .order(by: "geohash")
                 .start(at: [start])
                 .end(at: [end])
-                .addSnapshotListener { [weak self] snap, err in
+                .addSnapshotListener { [weak self] snapshot, error in
                     guard let self else { return }
 
-                    if let err = err {
-                        print("Firestore listener error:", err.localizedDescription)
-                        return
-                    }
-
-                    if let docs = snap?.documents {
-                        for doc in docs {
-                            let d = doc.data()
-                            guard
-                                let text = d["text"] as? String,
-                                let vis = d["visibility"] as? String,
-                                let geo = d["location"] as? GeoPoint
-                            else { continue }
-
-                            let item = DropItem(
-                                id: doc.documentID,
-                                text: text,
-                                author: User(id: d["authorId"] as? String ?? "unknown",
-                                             name: "Unknown"),
-                                createdAt: (d["createdAt"] as? Timestamp)?.dateValue() ?? .now,
-                                coordinate: CLLocationCoordinate2D(latitude: geo.latitude,
-                                                                   longitude: geo.longitude),
-                                visibility: DropVisibility(rawValue: vis) ?? .public
-                            )
-                            collected[item.id] = item
+                    Task { @MainActor in
+                        if let error {
+                            print("Firestore listener error:", error.localizedDescription)
+                            return
                         }
-                    }
 
-                    self.drops = collected.values.sorted(by: { $0.createdAt > $1.createdAt })
+                        guard let snapshot else { return }
+
+                        for change in snapshot.documentChanges {
+                            let doc = change.document
+                            switch change.type {
+                            case .added, .modified:
+                                if let item = self.makeDropItem(from: doc) {
+                                    self.dropCache[item.id] = item
+                                }
+                            case .removed:
+                                self.dropCache.removeValue(forKey: doc.documentID)
+                            @unknown default:
+                                break
+                            }
+                        }
+
+                        self.drops = self.dropCache.values.sorted(by: { $0.createdAt > $1.createdAt })
+                    }
                 }
+
+            listeners.append(registration)
         }
+    }
+
+    func refreshNearby() {
+        guard let bounds = lastBounds else { return }
+        listenNearby(minLat: bounds.minLat, maxLat: bounds.maxLat, minLon: bounds.minLon, maxLon: bounds.maxLon)
+    }
+
+    private func makeDropItem(from doc: QueryDocumentSnapshot) -> DropItem? {
+        let data = doc.data()
+        guard
+            let text = data["text"] as? String,
+            let visibilityRaw = data["visibility"] as? String,
+            let location = data["location"] as? GeoPoint
+        else { return nil }
+
+        return DropItem(
+            id: doc.documentID,
+            text: text,
+            author: User(id: data["authorId"] as? String ?? "unknown",
+                         name: "Unknown"),
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? .now,
+            coordinate: CLLocationCoordinate2D(latitude: location.latitude,
+                                               longitude: location.longitude),
+            visibility: DropVisibility(rawValue: visibilityRaw) ?? .public
+        )
+    }
+
+    func stopListening() {
+        for listener in listeners {
+            listener.remove()
+        }
+        listeners.removeAll()
+        dropCache.removeAll()
+        lastBounds = nil
     }
 
     // MARK: - Reactions & Lifts (Local Only for Now)

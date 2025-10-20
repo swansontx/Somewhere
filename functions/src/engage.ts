@@ -1,10 +1,35 @@
 import * as admin from "firebase-admin";
+import { AppOptions } from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 import axios from "axios";
 import { axiosWithRetry } from "./retry";
 import moment from "moment-timezone";
 
-admin.initializeApp();
+let firebaseConfig: { projectId?: string } | undefined;
+if (process.env.FIREBASE_CONFIG) {
+  try {
+    firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
+  } catch (err) {
+    console.warn("Failed to parse FIREBASE_CONFIG env", err);
+  }
+}
+const resolvedProjectId =
+  firebaseConfig?.projectId ||
+  process.env.GCLOUD_PROJECT ||
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  undefined;
+
+const appOptions: AppOptions = {};
+if (resolvedProjectId) {
+  appOptions.projectId = resolvedProjectId;
+}
+if (!appOptions.projectId && process.env.FIRESTORE_EMULATOR_HOST) {
+  appOptions.projectId = "demo";
+}
+
+if (!admin.apps.length) {
+  admin.initializeApp(appOptions);
+}
 const db = admin.firestore();
 
 export const postEvent = async (req: any, res: any) => {

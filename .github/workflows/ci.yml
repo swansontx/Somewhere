@@ -23,7 +23,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Cache npm
         uses: actions/cache@v4
@@ -36,6 +36,10 @@ jobs:
       - name: Install functions deps
         working-directory: ./functions
         run: npm ci --silent
+
+      - name: Install firebase-tools via official installer (fallback)
+        run: |
+          curl -sL https://firebase.tools | bash || true
 
       - name: Start Firestore emulator
         working-directory: ./functions

@@ -58,6 +58,9 @@ struct HomeView: View {
                 Spacer()
             }
         }
+        .frame(maxWidth: 480)
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity)
         .onAppear { authUser = Auth.auth().currentUser }
         .animation(.easeInOut, value: authUser != nil)
     }

@@ -70,7 +70,10 @@ final class DropStore: ObservableObject {
             "visibility": visibility.rawValue,
             "location": GeoPoint(latitude: coordinate.latitude,
                                  longitude: coordinate.longitude),
-            "geohash": geohash
+            "geohash": geohash,
+            // aggregate engagement counters (kept in sync transactionally)
+            "reactions": 0,
+            "lifts": 0
         ]
 
         db.collection("drops").addDocument(data: data) { error in
@@ -126,9 +129,15 @@ final class DropStore: ObservableObject {
                                 createdAt: (d["createdAt"] as? Timestamp)?.dateValue() ?? .now,
                                 coordinate: CLLocationCoordinate2D(latitude: geo.latitude,
                                                                    longitude: geo.longitude),
-                                visibility: DropVisibility(rawValue: vis) ?? .public
+                                visibility: DropVisibility(rawValue: vis) ?? .public,
+                                reactions: d["reactions"] as? Int ?? 0,
+                                isLiftedByCurrentUser: self.lifted.contains(doc.documentID)
                             )
                             collected[item.id] = item
+
+                            if let userId = self.currentUser?.id ?? Auth.auth().currentUser?.uid {
+                                self.refreshLiftState(for: doc.reference, dropId: doc.documentID, userId: userId)
+                            }
                         }
                     }
 
@@ -137,22 +146,129 @@ final class DropStore: ObservableObject {
         }
     }
 
-    // MARK: - Reactions & Lifts (Local Only for Now)
+    // MARK: - Reactions & Lifts
 
     func toggleLift(_ drop: DropItem) {
-        if lifted.contains(drop.id) {
-            lifted.remove(drop.id)
-        } else {
-            lifted.insert(drop.id)
+        guard let userId = currentUser?.id ?? Auth.auth().currentUser?.uid else {
+            print("User not signed in")
+            return
         }
-        if let i = drops.firstIndex(where: { $0.id == drop.id }) {
-            drops[i].isLiftedByCurrentUser = lifted.contains(drop.id)
-        }
+
+        let dropRef = db.collection("drops").document(drop.id)
+        let engagementRef = dropRef.collection("engagements").document(userId)
+
+        db.runTransaction({ transaction, errorPointer -> Any? in
+            do {
+                _ = try transaction.getDocument(dropRef)
+            } catch let error as NSError {
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            let engagementSnapshot: DocumentSnapshot
+            do {
+                engagementSnapshot = try transaction.getDocument(engagementRef)
+            } catch let error as NSError {
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            let currentlyLifted = (engagementSnapshot.data()?["lifted"] as? Bool) ?? false
+
+            if currentlyLifted {
+                transaction.updateData(["lifts": FieldValue.increment(Int64(-1))], forDocument: dropRef)
+                transaction.deleteDocument(engagementRef)
+                return false
+            } else {
+                transaction.updateData(["lifts": FieldValue.increment(Int64(1))], forDocument: dropRef)
+                transaction.setData([
+                    "lifted": true,
+                    "updatedAt": FieldValue.serverTimestamp()
+                ], forDocument: engagementRef, merge: true)
+                return true
+            }
+        }, completion: { [weak self] result, error in
+            guard let self else { return }
+            if let error = error {
+                print("Failed to toggle lift:", error.localizedDescription)
+                return
+            }
+
+            let isLifted = (result as? Bool) ?? false
+            Task { @MainActor in
+                if isLifted {
+                    self.lifted.insert(drop.id)
+                } else {
+                    self.lifted.remove(drop.id)
+                }
+
+                if let index = self.drops.firstIndex(where: { $0.id == drop.id }) {
+                    self.drops[index].isLiftedByCurrentUser = isLifted
+                }
+            }
+        })
     }
 
     func react(to drop: DropItem) {
-        if let i = drops.firstIndex(where: { $0.id == drop.id }) {
-            drops[i].reactions += 1
+        guard let userId = currentUser?.id ?? Auth.auth().currentUser?.uid else {
+            print("User not signed in")
+            return
+        }
+
+        let dropRef = db.collection("drops").document(drop.id)
+        let engagementRef = dropRef.collection("engagements").document(userId)
+
+        db.runTransaction({ transaction, errorPointer -> Any? in
+            do {
+                _ = try transaction.getDocument(dropRef)
+            } catch let error as NSError {
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            transaction.updateData(["reactions": FieldValue.increment(Int64(1))], forDocument: dropRef)
+            transaction.setData([
+                "reactionCount": FieldValue.increment(Int64(1)),
+                "updatedAt": FieldValue.serverTimestamp()
+            ], forDocument: engagementRef, merge: true)
+
+            return nil
+        }, completion: { [weak self] _, error in
+            guard let self else { return }
+            if let error = error {
+                print("Failed to react:", error.localizedDescription)
+                return
+            }
+
+            Task { @MainActor in
+                if let index = self.drops.firstIndex(where: { $0.id == drop.id }) {
+                    self.drops[index].reactions += 1
+                }
+            }
+        })
+    }
+
+    private func refreshLiftState(for dropRef: DocumentReference, dropId: String, userId: String) {
+        dropRef.collection("engagements").document(userId).getDocument { [weak self] snapshot, error in
+            guard let self else { return }
+            if let error = error {
+                print("Failed to refresh lift state:", error.localizedDescription)
+                return
+            }
+
+            let isLifted = (snapshot?.data()?["lifted"] as? Bool) ?? false
+
+            Task { @MainActor in
+                if isLifted {
+                    self.lifted.insert(dropId)
+                } else {
+                    self.lifted.remove(dropId)
+                }
+
+                if let index = self.drops.firstIndex(where: { $0.id == dropId }) {
+                    self.drops[index].isLiftedByCurrentUser = isLifted
+                }
+            }
         }
     }
 }

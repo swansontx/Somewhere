@@ -35,10 +35,14 @@ jobs:
 
       - name: Install functions deps
         working-directory: ./functions
+        env:
+          NODE_ENV: development
         run: npm ci --silent
 
       - name: Start Firestore emulator (use local binary when possible)
         working-directory: ./functions
+        env:
+          NODE_ENV: development
         run: |
           echo "Listing ./node_modules/.bin"
           ls -la ./node_modules/.bin || true

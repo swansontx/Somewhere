@@ -42,7 +42,9 @@ struct DropDetailScreen: View, Identifiable {
 
             Spacer()
         }
-        .presentationDetents([.medium, .large])
+        .frame(maxWidth: 420)
         .padding()
+        .frame(maxWidth: .infinity)
+        .presentationDetents([.medium, .large])
     }
 }

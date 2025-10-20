@@ -22,9 +22,16 @@ struct DropItem: Identifiable, Hashable {
     var visibility: DropVisibility
     var reactions: Int = 0
     var isLiftedByCurrentUser: Bool = false
+    var syncStatus: DropSyncStatus = .synced
 
     static func == (lhs: DropItem, rhs: DropItem) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+enum DropSyncStatus: Equatable {
+    case synced
+    case pending
+    case failed(message: String)
 }
 
 struct FriendLink: Identifiable, Hashable {

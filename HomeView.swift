@@ -1,40 +1,34 @@
 import SwiftUI
 import AuthenticationServices
-import FirebaseAuth
 import CryptoKit
 
 struct HomeView: View {
+    @EnvironmentObject var store: DropStore
     @Binding var showCreate: Bool
-    @State private var authUser: FirebaseAuth.User? = Auth.auth().currentUser  // <— use FirebaseAuth.User here
     @State private var nonce = ""
 
     var body: some View {
         VStack(spacing: 24) {
-
-            if authUser == nil {
-                Text("Welcome to Somewhere")
-                    .font(.largeTitle).bold()
+            if store.currentUser == nil {
+                ProgressView("Preparing your account…")
                     .padding(.top, 60)
-
-                Text("Sign in to start dropping your thoughts.")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal)
-
-                SignInWithAppleButton(.signIn, onRequest: configure, onCompletion: handle)
-                    .signInWithAppleButtonStyle(.black)
-                    .frame(height: 55)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .padding(.horizontal)
+                Spacer()
             } else {
-                Text("Drop something?")
+                Text(store.isUsingAnonymousAccount ? "Welcome to Somewhere" : "Drop something?")
                     .font(.largeTitle).bold()
-                    .padding(.top, 40)
+                    .padding(.top, store.isUsingAnonymousAccount ? 60 : 40)
 
-                Text("Leave a short thought where you are. Choose who can see it: Public, Friends, or Private.")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal)
+                if store.isUsingAnonymousAccount {
+                    Text("Drop anonymously or sign in with Apple to save your thoughts across devices.")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal)
+                } else {
+                    Text("Leave a short thought where you are. Choose who can see it: Public, Friends, or Private.")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal)
+                }
 
                 Button {
                     showCreate = true
@@ -48,24 +42,40 @@ struct HomeView: View {
                 }
                 .padding(.horizontal)
 
-                Button("Sign out") {
-                    try? Auth.auth().signOut()
-                    authUser = nil
+                if store.isUsingAnonymousAccount {
+                    SignInWithAppleButton(.signIn, onRequest: configure, onCompletion: handle)
+                        .signInWithAppleButtonStyle(.black)
+                        .frame(height: 55)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .padding(.horizontal)
+                        .padding(.top, 4)
+                } else {
+                    Button("Sign out") {
+                        store.signOut()
+                    }
+                    .padding(.top, 8)
+                    .foregroundColor(.red)
                 }
-                .padding(.top, 8)
-                .foregroundColor(.red)
 
                 Spacer()
             }
         }
-        .onAppear { authUser = Auth.auth().currentUser }
-        .animation(.easeInOut, value: authUser != nil)
+        .animation(.easeInOut, value: store.currentUser?.id ?? "")
+        .alert("Authentication Error", isPresented: Binding(
+            get: { store.authError != nil },
+            set: { if !$0 { store.authError = nil } }
+        )) {
+            Button("OK", role: .cancel) { store.authError = nil }
+        } message: {
+            Text(store.authError ?? "")
+        }
     }
 }
 
 // MARK: - Sign in with Apple helpers
 extension HomeView {
     private func configure(_ request: ASAuthorizationAppleIDRequest) {
+        store.authError = nil
         nonce = randomNonce()
         request.requestedScopes = [.fullName, .email]
         request.nonce = sha256(nonce)
@@ -80,20 +90,11 @@ extension HomeView {
                 let tokenString = String(data: tokenData, encoding: .utf8)
             else { return }
 
-            // New API in recent FirebaseAuth:
-            let credential = OAuthProvider.appleCredential(
-                withIDToken: tokenString,
-                rawNonce: nonce,
-                fullName: appleID.fullName
-            )
-
-            Auth.auth().signIn(with: credential) { _, error in
-                if let error = error { print("Sign in failed:", error.localizedDescription) }
-                authUser = Auth.auth().currentUser
-            }
+            store.signInWithApple(idToken: tokenString, nonce: nonce, fullName: appleID.fullName)
 
         case .failure(let error):
             print("Authorization error:", error.localizedDescription)
+            store.authError = error.localizedDescription
         }
     }
 }

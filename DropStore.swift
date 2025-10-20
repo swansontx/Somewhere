@@ -10,31 +10,48 @@ final class DropStore: ObservableObject {
 
     // Published state for UI
     @Published var currentUser: User? = nil
+    @Published var isUsingAnonymousAccount: Bool = true
+    @Published var authError: String? = nil
     @Published var drops: [DropItem] = []
     @Published var lifted: Set<String> = []
 
     private var listener: ListenerRegistration?
+    private var authListener: AuthStateDidChangeListenerHandle?
 
     init() {
-        Task { await ensureSignedIn() }
+        authListener = Auth.auth().addStateDidChangeListener { [weak self] _, user in
+            guard let self else { return }
+            self.updateCurrentUser(with: user)
+        }
+        ensureSignedIn()
+    }
+
+    deinit {
+        if let authListener {
+            Auth.auth().removeStateDidChangeListener(authListener)
+        }
     }
 
     // MARK: - Authentication Handling
 
     /// Ensures there's a Firebase Auth user (Apple or anonymous)
-    func ensureSignedIn() async {
+    func ensureSignedIn() {
         if Auth.auth().currentUser == nil {
-            do {
-                let result = try await Auth.auth().signInAnonymously()
-                print("Signed in anonymously as \(result.user.uid)")
-            } catch {
-                print("Anonymous sign-in failed:", error.localizedDescription)
+            Auth.auth().signInAnonymously { [weak self] result, error in
+                guard let self else { return }
+                if let error {
+                    print("Anonymous sign-in failed:", error.localizedDescription)
+                    self.authError = error.localizedDescription
+                    self.updateCurrentUser(with: nil)
+                } else if let user = result?.user {
+                    print("Signed in anonymously as \(user.uid)")
+                    self.authError = nil
+                    self.updateCurrentUser(with: user)
+                }
             }
-        }
-
-        if let authUser = Auth.auth().currentUser {
-            self.currentUser = User(id: authUser.uid,
-                                    name: authUser.displayName ?? "Guest")
+        } else {
+            authError = nil
+            updateCurrentUser(with: Auth.auth().currentUser)
         }
     }
 
@@ -42,10 +59,96 @@ final class DropStore: ObservableObject {
     func signOut() {
         do {
             try Auth.auth().signOut()
+            listener?.remove()
+            listener = nil
             currentUser = nil
             drops.removeAll()
+            lifted.removeAll()
+            isUsingAnonymousAccount = true
+            authError = nil
         } catch {
             print("Error signing out:", error.localizedDescription)
+            authError = error.localizedDescription
+        }
+        ensureSignedIn()
+    }
+
+    func signInWithApple(idToken: String, nonce: String, fullName: PersonNameComponents?) {
+        let credential = OAuthProvider.appleCredential(
+            withIDToken: idToken,
+            rawNonce: nonce,
+            fullName: fullName
+        )
+
+        let auth = Auth.auth()
+        let finish: (AuthDataResult?, Error?) -> Void = { [weak self] result, error in
+            guard let self else { return }
+
+            if let error {
+                print("Sign in failed:", error.localizedDescription)
+                self.authError = error.localizedDescription
+                return
+            }
+
+            if let user = result?.user ?? auth.currentUser {
+                self.authError = nil
+                self.applyDisplayNameIfNeeded(fullName, to: user)
+                self.updateCurrentUser(with: user)
+            }
+        }
+
+        if let current = auth.currentUser, current.isAnonymous {
+            current.link(with: credential) { result, error in
+                if let error = error as NSError?,
+                   error.code == AuthErrorCode.credentialAlreadyInUse.rawValue {
+                    auth.signIn(with: credential) { result, error in
+                        if error == nil {
+                            current.delete(completion: nil)
+                        }
+                        finish(result, error)
+                    }
+                } else {
+                    finish(result, error)
+                }
+            }
+        } else {
+            auth.signIn(with: credential, completion: finish)
+        }
+    }
+
+    private func updateCurrentUser(with authUser: FirebaseAuth.User?) {
+        guard let authUser else {
+            currentUser = nil
+            isUsingAnonymousAccount = true
+            return
+        }
+
+        isUsingAnonymousAccount = authUser.isAnonymous
+        let displayName = authUser.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        currentUser = User(id: authUser.uid,
+                           name: (displayName?.isEmpty == false ? displayName! : "Guest"))
+    }
+
+    private func applyDisplayNameIfNeeded(_ fullName: PersonNameComponents?,
+                                          to user: FirebaseAuth.User) {
+        guard let fullName else { return }
+
+        let formatter = PersonNameComponentsFormatter()
+        let displayName = formatter.string(from: fullName)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !displayName.isEmpty, user.displayName != displayName else { return }
+
+        let changeRequest = user.createProfileChangeRequest()
+        changeRequest.displayName = displayName
+        changeRequest.commitChanges { [weak self] error in
+            if let error {
+                print("Failed to update display name:", error.localizedDescription)
+                self?.authError = error.localizedDescription
+            } else {
+                self?.authError = nil
+                self?.updateCurrentUser(with: user)
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 import * as admin from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 import axios from "axios";
+import { axiosWithRetry } from "./retry";
 import moment from "moment-timezone";
 
 admin.initializeApp();
@@ -140,10 +141,10 @@ async function askGooseAgent(input: any) {
   const apiKey = process.env.GOOSE_API_KEY;
   if (url) {
     try {
-      const resp = await axios.post(url, { input }, { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined, timeout: 3000 });
-      if (resp.data) return resp.data;
+      const resp = await axiosWithRetry<any>({ method: 'post', url, data: { input }, headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined, timeout: 3000 }, 3, 200);
+      if (resp) return resp;
     } catch (e: any) {
-      console.warn("Goose agent call failed:", e.message);
+      console.warn("Goose agent call failed (after retries):", e.message);
       // fallthrough to heuristic
     }
   }

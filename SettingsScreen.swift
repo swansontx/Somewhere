@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SettingsScreen: View {
+    @EnvironmentObject var store: DropStore
     @State private var defaultVisibility: DropVisibility = .public
     @State private var notifyNearby = true
 
@@ -17,8 +18,25 @@ struct SettingsScreen: View {
                 }
 
                 Section("Account") {
-                    Button("Sign out") { /* hook later */ }
+                    if let user = store.currentUser {
+                        HStack {
+                            Text("Signed in as")
+                            Spacer()
+                            Text(user.name)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if store.isUsingAnonymousAccount {
+                        Text("You're using a guest account. Sign in with Apple from the Home tab to sync your drops across devices.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button("Sign out") {
+                            store.signOut()
+                        }
                         .foregroundStyle(.red)
+                    }
                 }
             }
             .navigationTitle("Settings")

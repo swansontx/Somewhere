@@ -1,9 +1,34 @@
 import * as admin from "firebase-admin";
+import { AppOptions } from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 import axios from "axios";
 import { axiosWithRetry } from "./retry";
 
-admin.initializeApp();
+let firebaseConfig: { projectId?: string } | undefined;
+if (process.env.FIREBASE_CONFIG) {
+  try {
+    firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
+  } catch (err) {
+    console.warn("Failed to parse FIREBASE_CONFIG env", err);
+  }
+}
+const resolvedProjectId =
+  firebaseConfig?.projectId ||
+  process.env.GCLOUD_PROJECT ||
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  undefined;
+
+const appOptions: AppOptions = {};
+if (resolvedProjectId) {
+  appOptions.projectId = resolvedProjectId;
+}
+if (!appOptions.projectId && process.env.FIRESTORE_EMULATOR_HOST) {
+  appOptions.projectId = "demo";
+}
+
+if (!admin.apps.length) {
+  admin.initializeApp(appOptions);
+}
 const db = admin.firestore();
 
 export const postEvent = async (req: any, res: any) => {
@@ -31,6 +56,7 @@ export const postEvent = async (req: any, res: any) => {
     }
 
     const result = await routeAction(uid, decision);
+    await persistEngagement(uid, type, decision, payload ?? null, result);
     return res.json({ ok: true, result });
   } catch (e: any) {
     console.error(e);
@@ -158,6 +184,93 @@ async function persistDecision(uid: string, type: string, decision: any) {
   });
 }
 
+async function persistEngagement(uid: string, triggerId: string, decision: any, payload: any, result: any) {
+  const now = admin.firestore.Timestamp.now();
+  const dropId = extractDropId(payload, decision);
+  const base = {
+    triggerId,
+    decision: decision?.action ?? null,
+    reason: decision?.reason ?? null,
+    score: decision?.score ?? null,
+    dropId: dropId ?? null,
+    payload: sanitizeForFirestore(payload ?? null),
+    result: sanitizeForFirestore(result ?? null),
+  };
+
+  const userRef = db.collection("users").doc(uid);
+  const engagementsCol = userRef.collection("engagements");
+  const docId = dropId ? `${dropId}_${triggerId}` : undefined;
+
+  await db.runTransaction(async (tx) => {
+    tx.set(
+      userRef,
+      {
+        stats: {
+          lastEngagedAt: now,
+          engagementsCount: admin.firestore.FieldValue.increment(1),
+          engagementsByTrigger: {
+            [triggerId]: admin.firestore.FieldValue.increment(1),
+          },
+        },
+      },
+      { merge: true }
+    );
+
+    if (docId) {
+      const engagementRef = engagementsCol.doc(docId);
+      const snap = await tx.get(engagementRef);
+      if (snap.exists) {
+        tx.update(engagementRef, {
+          ...base,
+          count: admin.firestore.FieldValue.increment(1),
+          lastEngagedAt: now,
+        });
+      } else {
+        tx.set(engagementRef, {
+          ...base,
+          count: 1,
+          firstEngagedAt: now,
+          lastEngagedAt: now,
+        });
+      }
+    } else {
+      const engagementRef = engagementsCol.doc();
+      tx.set(engagementRef, {
+        ...base,
+        count: 1,
+        firstEngagedAt: now,
+        lastEngagedAt: now,
+      });
+    }
+  });
+}
+
+function extractDropId(payload: any, decision: any) {
+  if (!payload && !decision) return null;
+  return (
+    payload?.dropId ??
+    payload?.drop?.id ??
+    payload?.dropID ??
+    decision?.dropId ??
+    decision?.dropID ??
+    null
+  );
+}
+
+function sanitizeForFirestore(input: any): any {
+  if (input === null || input === undefined) return null;
+  if (Array.isArray(input)) return input.map((item) => sanitizeForFirestore(item));
+  if (typeof input === "object") {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(input)) {
+      if (value === undefined) continue;
+      result[key] = sanitizeForFirestore(value);
+    }
+    return result;
+  }
+  return input;
+}
+
 async function routeAction(uid: string, decision: any) {
   if (decision.action === "message" && decision.body) {
     const msgRef = await db.collection("messages").add({
@@ -177,4 +290,4 @@ async function routeAction(uid: string, decision: any) {
 }
 
 // export internals used by tests
-export { applyRules, consumeToken, askGooseAgent };
+export { applyRules, consumeToken, askGooseAgent, persistEngagement };

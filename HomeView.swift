@@ -58,6 +58,9 @@ struct HomeView: View {
                 Spacer()
             }
         }
+        .frame(maxWidth: 480)
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity)
         .onAppear { authUser = Auth.auth().currentUser }
         .animation(.easeInOut, value: authUser != nil)
     }
@@ -87,13 +90,48 @@ extension HomeView {
                 fullName: appleID.fullName
             )
 
-            Auth.auth().signIn(with: credential) { _, error in
-                if let error = error { print("Sign in failed:", error.localizedDescription) }
-                authUser = Auth.auth().currentUser
+            let auth = Auth.auth()
+
+            if let currentUser = auth.currentUser, currentUser.isAnonymous {
+                currentUser.link(with: credential) { result, error in
+                    if let error = error as NSError? {
+                        guard error.code == AuthErrorCode.credentialAlreadyInUse.rawValue else {
+                            print("Linking failed:", error.localizedDescription)
+                            return
+                        }
+
+                        // The Apple credential is already in use on another account. Sign in with it instead.
+                        if let updatedCredential = error.userInfo[AuthErrorUserInfoUpdatedCredentialKey] as? AuthCredential {
+                            signIn(using: updatedCredential)
+                        } else {
+                            signIn(using: credential)
+                        }
+                        return
+                    }
+
+                    Task { @MainActor in
+                        authUser = result?.user ?? auth.currentUser
+                    }
+                }
+            } else {
+                signIn(using: credential)
             }
 
         case .failure(let error):
             print("Authorization error:", error.localizedDescription)
+        }
+    }
+
+    private func signIn(using credential: AuthCredential) {
+        Auth.auth().signIn(with: credential) { _, error in
+            if let error = error {
+                print("Sign in failed:", error.localizedDescription)
+                return
+            }
+
+            Task { @MainActor in
+                authUser = Auth.auth().currentUser
+            }
         }
     }
 }

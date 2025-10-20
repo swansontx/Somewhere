@@ -25,10 +25,12 @@ Prereqs:
 Steps:
 1. Install deps:
    cd functions && npm ci
-2. Start Firestore emulator:
-   firebase emulators:start --only firestore
-3. Run tests:
-   FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm test
+2. Start Firestore emulator and run the tests (npm will exit when the suite completes):
+   npm run test:emulator
+
+   _This command uses `firebase emulators:exec` so you do not need to manage the emulator lifecycle manually. If you prefer to
+   run the emulator separately, start it with `firebase emulators:start --only firestore` and then run
+   `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm test` in another terminal._
 
 
 ## Deploy

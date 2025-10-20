@@ -37,15 +37,26 @@ jobs:
         working-directory: ./functions
         run: npm ci --silent
 
-      - name: Install firebase-tools via official installer (fallback)
-        run: |
-          curl -sL https://firebase.tools | bash || true
-
-      - name: Start Firestore emulator
+      - name: Start Firestore emulator (use local binary when possible)
         working-directory: ./functions
         run: |
-          npx firebase emulators:start --only firestore --project demo &
-          npx wait-on tcp:127.0.0.1:8080
+          echo "Listing ./node_modules/.bin"
+          ls -la ./node_modules/.bin || true
+          if [ -x ./node_modules/.bin/firebase ]; then
+            echo "Using local firebase binary"
+            ./node_modules/.bin/firebase emulators:start --only firestore --project demo &
+          else
+            echo "Local firebase binary not found, attempting installer"
+            curl -sL https://firebase.tools | bash || true
+            firebase emulators:start --only firestore --project demo &
+          fi
+
+          # wait for emulator (prefer local wait-on)
+          if [ -x ./node_modules/.bin/wait-on ]; then
+            ./node_modules/.bin/wait-on tcp:127.0.0.1:8080
+          else
+            npx wait-on tcp:127.0.0.1:8080
+          fi
         env:
           FIREBASE_PROJECT: demo
 

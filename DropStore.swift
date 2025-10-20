@@ -13,10 +13,15 @@ final class DropStore: ObservableObject {
     @Published var drops: [DropItem] = []
     @Published var lifted: Set<String> = []
 
-    private var listener: ListenerRegistration?
+    private var listeners: [ListenerRegistration] = []
+    private var prefixBuckets: [String: [String: DropItem]] = [:]
 
     init() {
         Task { await ensureSignedIn() }
+    }
+
+    deinit {
+        removeAllListeners()
     }
 
     // MARK: - Authentication Handling
@@ -44,6 +49,7 @@ final class DropStore: ObservableObject {
             try Auth.auth().signOut()
             currentUser = nil
             drops.removeAll()
+            removeAllListeners()
         } catch {
             print("Error signing out:", error.localizedDescription)
         }
@@ -85,19 +91,21 @@ final class DropStore: ObservableObject {
     // MARK: - Nearby Fetch / Realtime Listener
 
     func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
-        listener?.remove()
+        removeAllListeners()
+        prefixBuckets.removeAll()
 
         let prefixes = Geohash.prefixesCovering(
             region: (minLat, maxLat, minLon, maxLon),
             precision: 5
         )
 
-        var collected: [String: DropItem] = [:]
+        var newListeners: [ListenerRegistration] = []
         for prefix in prefixes {
             let start = prefix
             let end = prefix + "\u{f8ff}"
+            let prefixKey = prefix
 
-            db.collection("drops")
+            let registration = db.collection("drops")
                 .order(by: "geohash")
                 .start(at: [start])
                 .end(at: [end])
@@ -109,6 +117,7 @@ final class DropStore: ObservableObject {
                         return
                     }
 
+                    var bucket: [String: DropItem] = [:]
                     if let docs = snap?.documents {
                         for doc in docs {
                             let d = doc.data()
@@ -128,13 +137,30 @@ final class DropStore: ObservableObject {
                                                                    longitude: geo.longitude),
                                 visibility: DropVisibility(rawValue: vis) ?? .public
                             )
-                            collected[item.id] = item
+                            bucket[item.id] = item
                         }
                     }
 
-                    self.drops = collected.values.sorted(by: { $0.createdAt > $1.createdAt })
+                    self.prefixBuckets[prefixKey] = bucket
+
+                    let merged = self.prefixBuckets.values.reduce(into: [String: DropItem]()) { partialResult, current in
+                        for (id, item) in current {
+                            partialResult[id] = item
+                        }
+                    }
+
+                    self.drops = merged.values.sorted(by: { $0.createdAt > $1.createdAt })
                 }
+            newListeners.append(registration)
         }
+        listeners = newListeners
+    }
+
+    private func removeAllListeners() {
+        for listener in listeners {
+            listener.remove()
+        }
+        listeners.removeAll()
     }
 
     // MARK: - Reactions & Lifts (Local Only for Now)

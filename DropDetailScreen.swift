@@ -5,31 +5,51 @@ struct DropDetailScreen: View, Identifiable {
     let id = UUID()
     let drop: DropItem
 
+    private var liveDrop: DropItem {
+        store.drops.first(where: { $0.id == drop.id }) ?? drop
+    }
+
     var body: some View {
+        let currentDrop = liveDrop
+        let isUpdating = store.isUpdating(dropId: currentDrop.id)
+        let actionsDisabled = isUpdating || store.currentUser == nil
+
         VStack(spacing: 12) {
             Capsule().fill(.secondary.opacity(0.3)).frame(width: 40, height: 5).padding(.top, 8)
 
-            Text(drop.text)
+            Text(currentDrop.text)
                 .font(.title3).bold()
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
 
-            Text("\(drop.author.name) • \(drop.visibility.rawValue) • \(drop.createdAt.formatted(date: .abbreviated, time: .shortened))")
+            Text("\(currentDrop.author.name) • \(currentDrop.visibility.rawValue) • \(currentDrop.createdAt.formatted(date: .abbreviated, time: .shortened))")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 16) {
                 Button {
-                    store.react(to: drop)
+                    Task { await store.react(to: currentDrop) }
                 } label: {
-                    Label("\(drop.reactions)", systemImage: "heart.fill")
+                    Label {
+                        Text("\(currentDrop.reactionCount)")
+                    } icon: {
+                        Image(systemName: currentDrop.hasReacted ? "heart.fill" : "heart")
+                    }
                 }
+                .tint(currentDrop.hasReacted ? .pink : .primary)
+                .disabled(actionsDisabled)
 
                 Button {
-                    store.toggleLift(drop)
+                    Task { await store.toggleLift(currentDrop) }
                 } label: {
-                    Label(drop.isLiftedByCurrentUser ? "Lifted" : "Lift", systemImage: "arrow.up.heart")
+                    Label {
+                        Text("\(currentDrop.liftCount)")
+                    } icon: {
+                        Image(systemName: "arrow.up.heart")
+                    }
                 }
+                .tint(currentDrop.isLiftedByCurrentUser ? .blue : .primary)
+                .disabled(actionsDisabled)
 
                 Button {
                     // placeholder for replies

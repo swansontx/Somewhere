@@ -49,6 +49,15 @@ struct MapScreen: View {
         .sheet(item: $selectedDrop) { drop in
             DropDetailScreen(drop: drop)
         }
+        .onAppear {
+            store.listenNearby(in: region)
+        }
+        .onDisappear {
+            store.stopListeningNearby()
+        }
+        .onChange(of: region) { newRegion in
+            store.listenNearby(in: newRegion)
+        }
         .gesture(
             LongPressGesture(minimumDuration: 0.5)
                 .sequenced(before: DragGesture(minimumDistance: 0))

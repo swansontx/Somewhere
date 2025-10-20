@@ -42,6 +42,11 @@ struct RootTabView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape") }
                 .tag(Tab.settings)
         }
+        .onChange(of: selectedTab) { newValue in
+            if newValue != .map {
+                store.stopListeningNearby()
+            }
+        }
         // 🧾 Sheet for creating a new drop
         .sheet(isPresented: $showCreate) {
             DropCreationScreen(

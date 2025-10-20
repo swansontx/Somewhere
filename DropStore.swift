@@ -13,10 +13,16 @@ final class DropStore: ObservableObject {
     @Published var drops: [DropItem] = []
     @Published var lifted: Set<String> = []
 
-    private var listener: ListenerRegistration?
+    private var listeners: [ListenerRegistration] = []
+    private var remoteDrops: [String: DropItem] = [:]
+    private var optimisticDrops: [String: DropItem] = [:]
 
     init() {
         Task { await ensureSignedIn() }
+    }
+
+    deinit {
+        listeners.forEach { $0.remove() }
     }
 
     // MARK: - Authentication Handling
@@ -44,6 +50,10 @@ final class DropStore: ObservableObject {
             try Auth.auth().signOut()
             currentUser = nil
             drops.removeAll()
+            optimisticDrops.removeAll()
+            remoteDrops.removeAll()
+            listeners.forEach { $0.remove() }
+            listeners.removeAll()
         } catch {
             print("Error signing out:", error.localizedDescription)
         }
@@ -59,28 +69,75 @@ final class DropStore: ObservableObject {
             return
         }
 
-        let geohash = Geohash.encode(latitude: coordinate.latitude,
-                                     longitude: coordinate.longitude,
-                                     precision: 7)
+        let createdAt = Date()
+        let docRef = db.collection("drops").document()
+        let dropId = docRef.documentID
+        let author = currentUser ?? User(id: user.uid, name: user.displayName ?? "You")
 
-        let data: [String: Any] = [
-            "text": text.trimmingCharacters(in: .whitespacesAndNewlines),
-            "authorId": user.uid,
-            "createdAt": Timestamp(date: Date()),
-            "visibility": visibility.rawValue,
-            "location": GeoPoint(latitude: coordinate.latitude,
-                                 longitude: coordinate.longitude),
-            "geohash": geohash,
-            // aggregate engagement counters (kept in sync transactionally)
-            "reactions": 0,
-            "lifts": 0
-        ]
+        var optimistic = DropItem(
+            id: dropId,
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            author: author,
+            createdAt: createdAt,
+            coordinate: coordinate,
+            visibility: visibility,
+            reactions: 0,
+            isLiftedByCurrentUser: false,
+            syncStatus: .pending
+        )
 
-        db.collection("drops").addDocument(data: data) { error in
-            if let error = error {
-                print("Error creating drop:", error.localizedDescription)
-            } else {
-                print("✅ Drop created successfully")
+        optimisticDrops[dropId] = optimistic
+        publishDrops()
+
+        let payload = dropPayload(for: optimistic, authorId: user.uid)
+
+        docRef.setData(payload) { [weak self] error in
+            guard let self else { return }
+            Task { @MainActor in
+                if let error = error {
+                    print("Error creating drop:", error.localizedDescription)
+                    optimistic.syncStatus = .failed(message: error.localizedDescription)
+                    self.optimisticDrops[dropId] = optimistic
+                } else {
+                    optimistic.syncStatus = .synced
+                    self.optimisticDrops[dropId] = optimistic
+                    print("✅ Drop created successfully")
+                }
+                self.publishDrops()
+            }
+        }
+    }
+
+    func retryCreate(drop: DropItem) {
+        guard case .failed = drop.syncStatus else { return }
+        guard let user = Auth.auth().currentUser else {
+            print("User not signed in")
+            return
+        }
+
+        var retryDrop = drop
+        retryDrop.author = User(id: user.uid, name: user.displayName ?? drop.author.name)
+        retryDrop.createdAt = Date()
+        retryDrop.syncStatus = .pending
+        optimisticDrops[drop.id] = retryDrop
+        publishDrops()
+
+        let payload = dropPayload(for: retryDrop, authorId: user.uid)
+        let docRef = db.collection("drops").document(drop.id)
+
+        docRef.setData(payload) { [weak self] error in
+            guard let self else { return }
+            Task { @MainActor in
+                if let error = error {
+                    print("Retry failed:", error.localizedDescription)
+                    retryDrop.syncStatus = .failed(message: error.localizedDescription)
+                    self.optimisticDrops[drop.id] = retryDrop
+                } else {
+                    retryDrop.syncStatus = .synced
+                    self.optimisticDrops[drop.id] = retryDrop
+                    print("✅ Drop retried successfully")
+                }
+                self.publishDrops()
             }
         }
     }
@@ -88,19 +145,20 @@ final class DropStore: ObservableObject {
     // MARK: - Nearby Fetch / Realtime Listener
 
     func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
-        listener?.remove()
+        listeners.forEach { $0.remove() }
+        listeners.removeAll()
+        remoteDrops.removeAll()
 
         let prefixes = Geohash.prefixesCovering(
             region: (minLat, maxLat, minLon, maxLon),
             precision: 5
         )
 
-        var collected: [String: DropItem] = [:]
         for prefix in prefixes {
             let start = prefix
             let end = prefix + "\u{f8ff}"
 
-            db.collection("drops")
+            let registration = db.collection("drops")
                 .order(by: "geohash")
                 .start(at: [start])
                 .end(at: [end])
@@ -112,163 +170,114 @@ final class DropStore: ObservableObject {
                         return
                     }
 
-                    if let docs = snap?.documents {
-                        for doc in docs {
-                            let d = doc.data()
-                            guard
-                                let text = d["text"] as? String,
-                                let vis = d["visibility"] as? String,
-                                let geo = d["location"] as? GeoPoint
-                            else { continue }
+                    guard let snap else { return }
 
-                            let item = DropItem(
-                                id: doc.documentID,
-                                text: text,
-                                author: User(id: d["authorId"] as? String ?? "unknown",
-                                             name: "Unknown"),
-                                createdAt: (d["createdAt"] as? Timestamp)?.dateValue() ?? .now,
-                                coordinate: CLLocationCoordinate2D(latitude: geo.latitude,
-                                                                   longitude: geo.longitude),
-                                visibility: DropVisibility(rawValue: vis) ?? .public,
-                                reactions: d["reactions"] as? Int ?? 0,
-                                isLiftedByCurrentUser: self.lifted.contains(doc.documentID)
-                            )
-                            collected[item.id] = item
+                    for change in snap.documentChanges {
+                        let doc = change.document
+                        let data = doc.data()
+                        guard
+                            let text = data["text"] as? String,
+                            let vis = data["visibility"] as? String,
+                            let geo = data["location"] as? GeoPoint
+                        else { continue }
 
-                            if let userId = self.currentUser?.id ?? Auth.auth().currentUser?.uid {
-                                self.refreshLiftState(for: doc.reference, dropId: doc.documentID, userId: userId)
-                            }
+                        let item = DropItem(
+                            id: doc.documentID,
+                            text: text,
+                            author: User(id: data["authorId"] as? String ?? "unknown",
+                                         name: "Unknown"),
+                            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? .now,
+                            coordinate: CLLocationCoordinate2D(latitude: geo.latitude,
+                                                               longitude: geo.longitude),
+                            visibility: DropVisibility(rawValue: vis) ?? .public,
+                            reactions: 0,
+                            isLiftedByCurrentUser: lifted.contains(doc.documentID),
+                            syncStatus: .synced
+                        )
+
+                        switch change.type {
+                        case .added, .modified:
+                            self.remoteDrops[item.id] = item
+                        case .removed:
+                            self.remoteDrops.removeValue(forKey: item.id)
+                        @unknown default:
+                            break
                         }
                     }
 
-                    self.drops = collected.values.sorted(by: { $0.createdAt > $1.createdAt })
+                    self.publishDrops()
                 }
+            listeners.append(registration)
         }
     }
 
-    // MARK: - Reactions & Lifts
+    // MARK: - Reactions & Lifts (Local Only for Now)
 
     func toggleLift(_ drop: DropItem) {
-        guard let userId = currentUser?.id ?? Auth.auth().currentUser?.uid else {
-            print("User not signed in")
-            return
+        if lifted.contains(drop.id) {
+            lifted.remove(drop.id)
+        } else {
+            lifted.insert(drop.id)
         }
-
-        let dropRef = db.collection("drops").document(drop.id)
-        let engagementRef = dropRef.collection("engagements").document(userId)
-
-        db.runTransaction({ transaction, errorPointer -> Any? in
-            do {
-                _ = try transaction.getDocument(dropRef)
-            } catch let error as NSError {
-                errorPointer?.pointee = error
-                return nil
-            }
-
-            let engagementSnapshot: DocumentSnapshot
-            do {
-                engagementSnapshot = try transaction.getDocument(engagementRef)
-            } catch let error as NSError {
-                errorPointer?.pointee = error
-                return nil
-            }
-
-            let currentlyLifted = (engagementSnapshot.data()?["lifted"] as? Bool) ?? false
-
-            if currentlyLifted {
-                transaction.updateData(["lifts": FieldValue.increment(Int64(-1))], forDocument: dropRef)
-                transaction.deleteDocument(engagementRef)
-                return false
-            } else {
-                transaction.updateData(["lifts": FieldValue.increment(Int64(1))], forDocument: dropRef)
-                transaction.setData([
-                    "lifted": true,
-                    "updatedAt": FieldValue.serverTimestamp()
-                ], forDocument: engagementRef, merge: true)
-                return true
-            }
-        }, completion: { [weak self] result, error in
-            guard let self else { return }
-            if let error = error {
-                print("Failed to toggle lift:", error.localizedDescription)
-                return
-            }
-
-            let isLifted = (result as? Bool) ?? false
-            Task { @MainActor in
-                if isLifted {
-                    self.lifted.insert(drop.id)
-                } else {
-                    self.lifted.remove(drop.id)
-                }
-
-                if let index = self.drops.firstIndex(where: { $0.id == drop.id }) {
-                    self.drops[index].isLiftedByCurrentUser = isLifted
-                }
-            }
-        })
+        if let i = drops.firstIndex(where: { $0.id == drop.id }) {
+            drops[i].isLiftedByCurrentUser = lifted.contains(drop.id)
+        }
+        if var remote = remoteDrops[drop.id] {
+            remote.isLiftedByCurrentUser = lifted.contains(drop.id)
+            remoteDrops[drop.id] = remote
+        }
+        if var optimistic = optimisticDrops[drop.id] {
+            optimistic.isLiftedByCurrentUser = lifted.contains(drop.id)
+            optimisticDrops[drop.id] = optimistic
+        }
+        publishDrops()
     }
 
     func react(to drop: DropItem) {
-        guard let userId = currentUser?.id ?? Auth.auth().currentUser?.uid else {
-            print("User not signed in")
-            return
+        if let i = drops.firstIndex(where: { $0.id == drop.id }) {
+            drops[i].reactions += 1
         }
-
-        let dropRef = db.collection("drops").document(drop.id)
-        let engagementRef = dropRef.collection("engagements").document(userId)
-
-        db.runTransaction({ transaction, errorPointer -> Any? in
-            do {
-                _ = try transaction.getDocument(dropRef)
-            } catch let error as NSError {
-                errorPointer?.pointee = error
-                return nil
-            }
-
-            transaction.updateData(["reactions": FieldValue.increment(Int64(1))], forDocument: dropRef)
-            transaction.setData([
-                "reactionCount": FieldValue.increment(Int64(1)),
-                "updatedAt": FieldValue.serverTimestamp()
-            ], forDocument: engagementRef, merge: true)
-
-            return nil
-        }, completion: { [weak self] _, error in
-            guard let self else { return }
-            if let error = error {
-                print("Failed to react:", error.localizedDescription)
-                return
-            }
-
-            Task { @MainActor in
-                if let index = self.drops.firstIndex(where: { $0.id == drop.id }) {
-                    self.drops[index].reactions += 1
-                }
-            }
-        })
+        if var remote = remoteDrops[drop.id] {
+            remote.reactions += 1
+            remoteDrops[drop.id] = remote
+        }
+        if var optimistic = optimisticDrops[drop.id] {
+            optimistic.reactions += 1
+            optimisticDrops[drop.id] = optimistic
+        }
+        publishDrops()
     }
 
-    private func refreshLiftState(for dropRef: DocumentReference, dropId: String, userId: String) {
-        dropRef.collection("engagements").document(userId).getDocument { [weak self] snapshot, error in
-            guard let self else { return }
-            if let error = error {
-                print("Failed to refresh lift state:", error.localizedDescription)
-                return
+    // MARK: - Helpers
+
+    private func publishDrops() {
+        let syncedIds = optimisticDrops.compactMap { id, drop -> String? in
+            if remoteDrops[id] != nil, drop.syncStatus == .synced {
+                return id
             }
-
-            let isLifted = (snapshot?.data()?["lifted"] as? Bool) ?? false
-
-            Task { @MainActor in
-                if isLifted {
-                    self.lifted.insert(dropId)
-                } else {
-                    self.lifted.remove(dropId)
-                }
-
-                if let index = self.drops.firstIndex(where: { $0.id == dropId }) {
-                    self.drops[index].isLiftedByCurrentUser = isLifted
-                }
-            }
+            return nil
         }
+        syncedIds.forEach { optimisticDrops.removeValue(forKey: $0) }
+
+        var combined = Array(remoteDrops.values)
+        combined.append(contentsOf: optimisticDrops.values)
+        combined.sort(by: { $0.createdAt > $1.createdAt })
+        drops = combined
+    }
+
+    private func dropPayload(for drop: DropItem, authorId: String) -> [String: Any] {
+        let geohash = Geohash.encode(latitude: drop.coordinate.latitude,
+                                     longitude: drop.coordinate.longitude,
+                                     precision: 7)
+
+        return [
+            "text": drop.text,
+            "authorId": authorId,
+            "createdAt": Timestamp(date: drop.createdAt),
+            "visibility": drop.visibility.rawValue,
+            "location": GeoPoint(latitude: drop.coordinate.latitude,
+                                  longitude: drop.coordinate.longitude),
+            "geohash": geohash
+        ]
     }
 }

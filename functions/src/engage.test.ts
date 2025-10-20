@@ -1,4 +1,4 @@
-import { applyRules, consumeToken } from './engage';
+import { applyRules, consumeToken, persistEngagement } from './engage';
 import * as admin from 'firebase-admin';
 
 // ensure emulator env + project for Firestore client
@@ -30,5 +30,39 @@ describe('engage integration tests (firestore emulator)', () => {
     const after = await applyRules({ type: 'app_open', ctx: { stats: {}, prefs: {}, tz: 'UTC' }, uid });
     // tokens decreased or capped
     expect(after.details.tokensAvailable).toBeGreaterThanOrEqual(0);
+  });
+
+  test('persistEngagement stores per-user engagement docs', async () => {
+    if (!process.env.FIRESTORE_EMULATOR_HOST) {
+      console.warn('Skipping emulator test: FIRESTORE_EMULATOR_HOST not set');
+      return;
+    }
+
+    const uid = `engagement-${Date.now()}`;
+    const triggerId = 'drop_view';
+    const dropId = 'drop-123';
+
+    const decision = { action: 'message', reason: 'nudge', score: 0.7 };
+    const payload = { dropId };
+
+    await persistEngagement(uid, triggerId, decision, payload, { sent: true, id: 'msg-1' });
+    await persistEngagement(uid, triggerId, decision, payload, { sent: true, id: 'msg-2' });
+
+    const engagementDoc = await admin
+      .firestore()
+      .doc(`users/${uid}/engagements/${dropId}_${triggerId}`)
+      .get();
+
+    expect(engagementDoc.exists).toBe(true);
+    expect(engagementDoc.get('count')).toBe(2);
+    expect(engagementDoc.get('decision')).toBe('message');
+    expect(engagementDoc.get('dropId')).toBe(dropId);
+    expect(engagementDoc.get('result.id')).toBe('msg-2');
+    expect(engagementDoc.get('firstEngagedAt')).toBeInstanceOf(admin.firestore.Timestamp);
+
+    const userDoc = await admin.firestore().doc(`users/${uid}`).get();
+    expect(userDoc.get('stats.engagementsCount')).toBe(2);
+    expect(userDoc.get(`stats.engagementsByTrigger.${triggerId}`)).toBe(2);
+    expect(userDoc.get('stats.lastEngagedAt')).toBeInstanceOf(admin.firestore.Timestamp);
   });
 });

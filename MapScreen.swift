@@ -56,6 +56,9 @@ struct MapScreen: View {
                     onRequestCreateAt(region.center)
                 }
         )
+        .onDisappear {
+            store.stopListening(shouldClearDrops: false)
+        }
     }
 
     private func color(for vis: DropVisibility) -> Color {

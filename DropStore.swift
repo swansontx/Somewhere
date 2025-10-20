@@ -13,7 +13,7 @@ final class DropStore: ObservableObject {
     @Published var drops: [DropItem] = []
     @Published var lifted: Set<String> = []
 
-    private var listener: ListenerRegistration?
+    private var listeners: [ListenerRegistration] = []
 
     init() {
         Task { await ensureSignedIn() }
@@ -44,6 +44,7 @@ final class DropStore: ObservableObject {
             try Auth.auth().signOut()
             currentUser = nil
             drops.removeAll()
+            stopListening()
         } catch {
             print("Error signing out:", error.localizedDescription)
         }
@@ -85,7 +86,7 @@ final class DropStore: ObservableObject {
     // MARK: - Nearby Fetch / Realtime Listener
 
     func listenNearby(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double) {
-        listener?.remove()
+        stopListening(shouldClearDrops: false)
 
         let prefixes = Geohash.prefixesCovering(
             region: (minLat, maxLat, minLon, maxLon),
@@ -97,7 +98,7 @@ final class DropStore: ObservableObject {
             let start = prefix
             let end = prefix + "\u{f8ff}"
 
-            db.collection("drops")
+            let registration = db.collection("drops")
                 .order(by: "geohash")
                 .start(at: [start])
                 .end(at: [end])
@@ -134,7 +135,20 @@ final class DropStore: ObservableObject {
 
                     self.drops = collected.values.sorted(by: { $0.createdAt > $1.createdAt })
                 }
+            listeners.append(registration)
         }
+    }
+
+    func stopListening(shouldClearDrops: Bool = true) {
+        listeners.forEach { $0.remove() }
+        listeners.removeAll()
+        if shouldClearDrops {
+            drops.removeAll()
+        }
+    }
+
+    deinit {
+        stopListening()
     }
 
     // MARK: - Reactions & Lifts (Local Only for Now)

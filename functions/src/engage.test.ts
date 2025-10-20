@@ -1,9 +1,11 @@
 import { applyRules, consumeToken, persistEngagement } from './engage';
 import * as admin from 'firebase-admin';
 
-// ensure emulator env + project for Firestore client
-process.env.FIRESTORE_EMULATOR_HOST = process.env.FIRESTORE_EMULATOR_HOST ?? "127.0.0.1:8080";
-process.env.GOOGLE_CLOUD_PROJECT = process.env.GOOGLE_CLOUD_PROJECT ?? "demo";
+// ensure the emulator-aware env vars are propagated when the emulator is running
+if (process.env.FIRESTORE_EMULATOR_HOST) {
+  process.env.GOOGLE_CLOUD_PROJECT = process.env.GOOGLE_CLOUD_PROJECT ?? 'demo';
+  process.env.GCLOUD_PROJECT = process.env.GCLOUD_PROJECT ?? process.env.GOOGLE_CLOUD_PROJECT;
+}
 
 jest.setTimeout(30000);
 

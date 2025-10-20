@@ -186,4 +186,4 @@ async function routeAction(uid: string, decision: any) {
 }
 
 // export internals used by tests
-export { applyRules, consumeToken, askGooseAgent };
+export { applyRules, consumeToken, askGooseAgent, routeAction };

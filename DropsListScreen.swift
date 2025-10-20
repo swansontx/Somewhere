@@ -15,5 +15,8 @@ struct DropsListScreen: View {
             }
             .navigationTitle("Drops")
         }
+        .onDisappear {
+            store.stopListening(shouldClearDrops: false)
+        }
     }
 }

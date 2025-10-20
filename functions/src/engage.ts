@@ -184,3 +184,6 @@ async function routeAction(uid: string, decision: any) {
   }
   return { skipped: true };
 }
+
+// export internals used by tests
+export { applyRules, consumeToken, askGooseAgent };

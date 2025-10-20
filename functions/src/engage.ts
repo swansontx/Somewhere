@@ -1,10 +1,34 @@
 import * as admin from "firebase-admin";
+import { AppOptions } from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 import axios from "axios";
 import { axiosWithRetry } from "./retry";
-import moment from "moment-timezone";
 
-admin.initializeApp();
+let firebaseConfig: { projectId?: string } | undefined;
+if (process.env.FIREBASE_CONFIG) {
+  try {
+    firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
+  } catch (err) {
+    console.warn("Failed to parse FIREBASE_CONFIG env", err);
+  }
+}
+const resolvedProjectId =
+  firebaseConfig?.projectId ||
+  process.env.GCLOUD_PROJECT ||
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  undefined;
+
+const appOptions: AppOptions = {};
+if (resolvedProjectId) {
+  appOptions.projectId = resolvedProjectId;
+}
+if (!appOptions.projectId && process.env.FIRESTORE_EMULATOR_HOST) {
+  appOptions.projectId = "demo";
+}
+
+if (!admin.apps.length) {
+  admin.initializeApp(appOptions);
+}
 const db = admin.firestore();
 
 export const postEvent = async (req: any, res: any) => {
@@ -59,14 +83,6 @@ async function applyRules({ type, ctx, uid }: { type: string; ctx: any; uid: str
   const last = toMillis(ctx.stats?.lastEngagedAt) ?? 0;
   const rateLimited = now - last < 1000 * 60 * 30; // 30m
 
-  // tz-aware quiet hours using moment-timezone
-  const tz = ctx.tz ?? process.env.DEFAULT_TZ ?? "UTC";
-  const quietHoursPref = ctx.prefs?.quietHours ?? { start: parseInt(process.env.DEFAULT_QUIET_START || "22"), end: parseInt(process.env.DEFAULT_QUIET_END || "8") };
-  const start = Number(quietHoursPref.start ?? 22);
-  const end = Number(quietHoursPref.end ?? 8);
-  const hour = Number(moment.tz(now, tz).hour());
-  const inQuiet = start > end ? (hour >= start || hour < end) : (hour >= start && hour < end);
-
   // velocity limiting (token bucket) instead of fixed daily cap
   const bucketCapacity = Number(process.env.TOKEN_CAPACITY ?? 5); // max burst
   const refillIntervalMs = Number(process.env.TOKEN_REFILL_INTERVAL_MS ?? 30 * 60 * 1000); // default 30min
@@ -90,9 +106,9 @@ async function applyRules({ type, ctx, uid }: { type: string; ctx: any; uid: str
 
   const capExceeded = tokensAvailable < 1;
 
-  const quiet = inQuiet;
-  const blocked = rateLimited || quiet || capExceeded;
-  const reason = rateLimited ? "rate_limit" : quiet ? "quiet_hours" : capExceeded ? "velocity_limit" : undefined;
+  const quiet = false;
+  const blocked = rateLimited || capExceeded;
+  const reason = rateLimited ? "rate_limit" : capExceeded ? "velocity_limit" : undefined;
   return { blocked, reason, details: { rateLimited, quiet, capExceeded, tokensAvailable, bucketCapacity, refillIntervalMs, refillTokens } };
 }
 

@@ -20,7 +20,9 @@ struct DropItem: Identifiable, Hashable {
     var createdAt: Date
     var coordinate: CLLocationCoordinate2D
     var visibility: DropVisibility
-    var reactions: Int = 0
+    var reactionCount: Int = 0
+    var liftCount: Int = 0
+    var hasReacted: Bool = false
     var isLiftedByCurrentUser: Bool = false
     var syncStatus: DropSyncStatus = .synced
 

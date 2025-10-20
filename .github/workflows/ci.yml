@@ -25,16 +25,22 @@ jobs:
         with:
           node-version: '18'
 
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('functions/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
       - name: Install functions deps
         working-directory: ./functions
-        run: npm install --no-audit --no-fund
-
-      - name: Install firebase-tools
-        run: npm install -g firebase-tools@11
+        run: npm ci --silent
 
       - name: Start Firestore emulator
+        working-directory: ./functions
         run: |
-          firebase emulators:start --only firestore --project demo --host 127.0.0.1 --port 8080 &
+          npx firebase emulators:start --only firestore --project demo &
           npx wait-on tcp:127.0.0.1:8080
         env:
           FIREBASE_PROJECT: demo
@@ -43,4 +49,4 @@ jobs:
         working-directory: ./functions
         env:
           FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
-        run: npm test
+        run: npm test --silent

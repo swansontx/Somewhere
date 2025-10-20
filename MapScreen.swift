@@ -8,6 +8,7 @@ struct MapScreen: View {
         span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
     )
     @State private var selectedDrop: DropItem?
+    @State private var regionUpdateTask: Task<Void, Never>? = nil
     @Binding var lastTappedLocation: CLLocationCoordinate2D
 
     var onRequestCreateAt: (CLLocationCoordinate2D) -> Void
@@ -49,6 +50,15 @@ struct MapScreen: View {
         .sheet(item: $selectedDrop) { drop in
             DropDetailScreen(drop: drop)
         }
+        .onAppear {
+            scheduleRegionUpdate(for: region, immediate: true)
+        }
+        .onDisappear {
+            regionUpdateTask?.cancel()
+        }
+        .onChange(of: region) { newRegion in
+            scheduleRegionUpdate(for: newRegion, immediate: false)
+        }
         .gesture(
             LongPressGesture(minimumDuration: 0.5)
                 .sequenced(before: DragGesture(minimumDistance: 0))
@@ -64,5 +74,31 @@ struct MapScreen: View {
         case .friends: return .green
         case .private: return .purple
         }
+    }
+
+    private func scheduleRegionUpdate(for region: MKCoordinateRegion, immediate: Bool) {
+        regionUpdateTask?.cancel()
+        let targetRegion = region
+        regionUpdateTask = Task { @MainActor in
+            if !immediate {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+            }
+            updateListeners(for: targetRegion)
+        }
+    }
+
+    private func updateListeners(for region: MKCoordinateRegion) {
+        let halfLat = max(region.span.latitudeDelta, 0) / 2
+        let halfLon = max(region.span.longitudeDelta, 0) / 2
+
+        let minLat = max(-90, region.center.latitude - halfLat)
+        let maxLat = min(90, region.center.latitude + halfLat)
+        let minLon = max(-180, region.center.longitude - halfLon)
+        let maxLon = min(180, region.center.longitude + halfLon)
+
+        store.listenNearby(minLat: minLat,
+                           maxLat: maxLat,
+                           minLon: minLon,
+                           maxLon: maxLon)
     }
 }

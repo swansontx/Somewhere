@@ -1,4 +1,5 @@
 import SwiftUI
+import MapKit
 
 struct DropsListScreen: View {
     @EnvironmentObject var store: DropStore
@@ -14,6 +15,38 @@ struct DropsListScreen: View {
                 }
             }
             .navigationTitle("Drops")
+            .refreshable {
+                if store.lastBounds != nil {
+                    store.refreshNearby()
+                } else {
+                    requestDefaultRegion()
+                }
+            }
+            .overlay {
+                if store.drops.isEmpty {
+                    ContentUnavailableView("No drops yet", systemImage: "cloud.sun") {
+                        Text("Pull to refresh to try again.")
+                    }
+                }
+            }
         }
+        .task {
+            guard store.lastBounds == nil else { return }
+            requestDefaultRegion()
+        }
+    }
+
+    private func requestDefaultRegion() {
+        let center = CLLocationCoordinate2D(latitude: 37.775, longitude: -122.418)
+        let span = MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+        let halfLat = max(span.latitudeDelta / 2, 0.002)
+        let halfLon = max(span.longitudeDelta / 2, 0.002)
+
+        let minLat = max(-90, center.latitude - halfLat)
+        let maxLat = min(90, center.latitude + halfLat)
+        let minLon = max(-180, center.longitude - halfLon)
+        let maxLon = min(180, center.longitude + halfLon)
+
+        store.listenNearby(minLat: minLat, maxLat: maxLat, minLon: minLon, maxLon: maxLon)
     }
 }

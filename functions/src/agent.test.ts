@@ -17,15 +17,15 @@ describe('Goose agent client', () => {
 
   test('uses external Goose agent when configured', async () => {
     process.env.GOOSE_AGENT_URL = 'https://example.com/agent';
-    mockedAxios.post.mockResolvedValue({ data: { action: 'none', reason: 'ok' } });
+    mockedAxios.request.mockResolvedValue({ data: { action: 'none', reason: 'ok' } });
     const res = await askGooseAgent({ type: 'anything', ctx: {} });
-    expect(mockedAxios.post).toHaveBeenCalled();
+    expect(mockedAxios.request).toHaveBeenCalled();
     expect(res.reason).toBe('ok');
   });
 
   test('handles agent errors gracefully', async () => {
     process.env.GOOSE_AGENT_URL = 'https://example.com/agent';
-    mockedAxios.post.mockRejectedValue(new Error('timeout'));
+    mockedAxios.request.mockRejectedValue(new Error('timeout'));
     const res = await askGooseAgent({ type: 'anything', ctx: {} });
     expect(res.action).toBeDefined();
   });

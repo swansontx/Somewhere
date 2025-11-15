@@ -62,3 +62,5 @@ fastlane/screenshots/**/*.png
 fastlane/test_output
 GoogleService-Info.plist
 functions/node_modules/
+# local odds api key
+backend/.odds_api_key
